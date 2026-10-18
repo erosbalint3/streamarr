@@ -408,6 +408,9 @@ export function sessionSummary(s) {
   };
 }
 
-// Clean leftovers from a previous run.
-fs.rmSync(config.transcodeDir, { recursive: true, force: true });
+// Clean leftovers from a previous run. Only the contents: the directory itself may be a
+// tmpfs mount point or sit in a root-owned parent we can't write to.
 fs.mkdirSync(config.transcodeDir, { recursive: true });
+for (const entry of fs.readdirSync(config.transcodeDir)) {
+  fs.rmSync(path.join(config.transcodeDir, entry), { recursive: true, force: true });
+}
