@@ -64,9 +64,15 @@ jobs:
       - name: Smoke test (amd64)
         if: github.event_name != 'pull_request'
         run: |
-          docker run -d --name sa -p 8420:8420 ghcr.io/${{ github.repository }}:sha-$(git rev-parse --short HEAD)
+          # Reproduce the common first-run setup: a root-owned bind mount (as Docker creates it).
+          sudo mkdir -p /tmp/sa-data/cache/images && sudo chown -R root:root /tmp/sa-data
+          docker run -d --name sa -p 8420:8420 -e PUID=1000 -e PGID=1000 -v /tmp/sa-data:/config \
+            ghcr.io/${{ github.repository }}:sha-$(git rev-parse --short HEAD)
           for i in $(seq 1 30); do curl -fs localhost:8420/api/health && break; sleep 2; done
           curl -fs localhost:8420/api/auth/status
+          test "$(stat -c '%u' /tmp/sa-data/cache)" = "1000"
+          test -f /tmp/sa-data/streamarr.db
+          docker exec sa sh -c 'cat /proc/1/status /proc/$(pgrep -f "server/src/index.js")/status | grep -E "^Uid"'
           docker exec sa ffmpeg -hide_banner -encoders | grep -E "libx264|h264_vaapi|h264_nvenc"
           docker exec sa ffmpeg -hide_banner -filters | grep -E " zscale| tonemap | scale_vaapi| scale_cuda"
           docker logs sa

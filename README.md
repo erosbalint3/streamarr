@@ -90,10 +90,10 @@ Several drives? Mount each under `/media` in `docker-compose.yml`:
 **Intel / AMD (VAAPI)**
 
 ```bash
-getent group render | cut -d: -f3   # put this in RENDER_GID in .env
-getent group video  | cut -d: -f3   # → VIDEO_GID
 docker compose -f docker-compose.yml -f docker-compose.vaapi.yml up -d --build
 ```
+
+The GPU's device group is picked up automatically.
 
 **NVIDIA (NVENC)** — install the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html), then:
 
@@ -119,7 +119,7 @@ Environment variables seed the defaults; everything below is also editable live 
 |---|---|---|
 | `MEDIA_DIR` | `/srv/media` | Host folder mounted read-only at `/media` |
 | `CONFIG_DIR` | `./data` | Database, artwork cache, trickplay sheets, subtitles |
-| `PUID` / `PGID` | `1000` | User the server runs as (must be able to read your media) |
+| `PUID` / `PGID` | `1000` | User the server runs as (must be able to read your media). The container takes ownership of its own data folder on start, so a root-created `./data` is fine. |
 | `TMDB_API_KEY` | – | v3 key or v4 read token |
 | `HWACCEL` | `none` | `none`, `vaapi`, `nvenc` |
 | `TRANSCODE_PRESET` | `veryfast` | libx264 preset for CPU transcodes |

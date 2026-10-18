@@ -21,7 +21,7 @@ ARG TARGETARCH
 RUN sed -i 's/^Components: main$/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources \
  && apt-get update \
  && apt-get install -y --no-install-recommends \
-      ffmpeg tini ca-certificates mesa-va-drivers vainfo \
+      ffmpeg tini ca-certificates util-linux mesa-va-drivers vainfo \
       $( [ "$TARGETARCH" = "amd64" ] && echo "intel-media-va-driver-non-free i965-va-driver" ) \
  && rm -rf /var/lib/apt/lists/*
 
@@ -29,6 +29,7 @@ WORKDIR /app
 COPY --from=deps /app/server/node_modules ./server/node_modules
 COPY server/ ./server/
 COPY --from=web /build/web/dist ./web/dist
+COPY --chmod=755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 ENV NODE_ENV=production \
     PORT=8420 \
@@ -39,14 +40,15 @@ ENV NODE_ENV=production \
     LIBVA_DRIVERS_PATH=/usr/lib/x86_64-linux-gnu/dri:/usr/lib/aarch64-linux-gnu/dri \
     NVIDIA_DRIVER_CAPABILITIES=compute,video,utility
 
-RUN mkdir -p /config /transcode /media && chown -R node:node /config /transcode
+RUN mkdir -p /config /transcode /media
 
-USER node
+# The entrypoint fixes ownership of /config and /transcode, then drops to PUID:PGID.
+ENV PUID=1000 PGID=1000
 EXPOSE 8420
 VOLUME ["/config"]
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||8420)+'/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
-ENTRYPOINT ["/usr/bin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/docker-entrypoint.sh"]
 CMD ["node", "--disable-warning=ExperimentalWarning", "server/src/index.js"]

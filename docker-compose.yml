@@ -15,9 +15,11 @@ services:
     restart: unless-stopped
     ports:
       - "${PORT:-8420}:8420"
-    # Run as the user that owns your media files (see `id` on the host).
-    user: "${PUID:-1000}:${PGID:-1000}"
     environment:
+      # The server runs as this user/group (see `id` on the host). It needs read access to
+      # your media; its own data folder is set up automatically.
+      PUID: ${PUID:-1000}
+      PGID: ${PGID:-1000}
       TZ: ${TZ:-UTC}
       TMDB_API_KEY: ${TMDB_API_KEY:-}
       HWACCEL: ${HWACCEL:-none}

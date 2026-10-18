@@ -46,5 +46,13 @@ export const settingDefaults = {
 };
 
 for (const dir of [configDir, cacheDir, config.imageCacheDir, config.subtitleCacheDir, config.trickplayDir, config.transcodeDir]) {
-  fs.mkdirSync(dir, { recursive: true });
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.accessSync(dir, fs.constants.W_OK);
+  } catch (e) {
+    const uid = process.getuid?.();
+    console.error(`\n[streamarr] Can't write to ${dir} (${e.code}). The server runs as uid ${uid}.`);
+    console.error(`[streamarr] Fix: sudo chown -R ${uid}:${process.getgid?.()} <the host folder mounted there>, or set PUID/PGID to its owner.\n`);
+    process.exit(1);
+  }
 }
