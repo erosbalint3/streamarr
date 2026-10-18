@@ -1,0 +1,138 @@
+// Decides HOW a file is delivered to a specific client. Order of preference:
+//   1. direct    – the original file over HTTP range requests (zero server CPU, perfect quality)
+//   2. remux     – video copied bit-for-bit, audio converted if needed, streamed as fragmented MP4
+//   3. transcode – adaptive-bitrate HLS ladder; the player switches renditions instead of stalling
+
+const MP4_AUDIO = new Set(['aac', 'mp3', 'ac3', 'eac3', 'opus', 'flac', 'alac']);
+const DIRECT_CONTAINERS = { mp4: 'mp4', mov: 'mp4', m4v: 'mp4', webm: 'webm' };
+
+export const LADDER = [
+  { id: '2160p', height: 2160, bitrate: 20_000_000 },
+  { id: '1440p', height: 1440, bitrate: 12_000_000 },
+  { id: '1080p', height: 1080, bitrate: 7_500_000 },
+  { id: '720p', height: 720, bitrate: 3_800_000 },
+  { id: '480p', height: 480, bitrate: 1_600_000 },
+  { id: '360p', height: 360, bitrate: 800_000 },
+];
+
+const even = (n) => Math.max(2, Math.round(n / 2) * 2);
+
+/** Resolution class: a 1920x800 scope movie is still "1080p". */
+export function classHeight(video) {
+  if (!video) return 0;
+  return Math.max(video.height, Math.round((video.width * 9) / 16));
+}
+
+export function audioBitrateFor(channels) {
+  return channels > 2 ? 384_000 : 192_000;
+}
+
+export function buildLadder(media, { hwaccel, maxSoftwareHeight, maxHeight }) {
+  const v = media.video;
+  const srcClass = classHeight(v);
+  const ceiling = Math.min(srcClass, hwaccel === 'none' ? maxSoftwareHeight : 2160, maxHeight || 2160);
+  const audioBr = media.audio.reduce((s, a) => s + (a.bitrate || 0), 0);
+  const srcVideoBr = v.bitrate || Math.max(500_000, (media.bitrate || 0) - audioBr) || 20_000_000;
+  const fpsBoost = (v.fps || 24) > 40 ? 1.4 : 1;
+
+  let rungs = LADDER.filter((r) => r.height <= ceiling);
+  if (!rungs.length) rungs = [LADDER[LADDER.length - 1]];
+  // Avoid near-duplicate rungs: if the source sits between rungs (e.g. 900p), add a native one.
+  return rungs.map((r) => {
+    const f = Math.min(1, r.height / srcClass);
+    const bitrate = Math.round(Math.min(r.bitrate * fpsBoost, srcVideoBr * 1.1) / 1000) * 1000;
+    return {
+      id: r.id,
+      width: even(v.width * f),
+      height: even(v.height * f),
+      bitrate: Math.max(bitrate, 400_000),
+    };
+  });
+}
+
+function videoSupported(v, caps) {
+  if (!v || !caps?.video?.[v.codec]) return [false, `${v?.codec || 'unknown'} video isn't supported by this device`];
+  if (v.codec === 'h264' && v.bitDepth > 8) return [false, '10-bit H.264 isn\'t playable in browsers'];
+  if (v.interlaced) return [false, 'interlaced video needs deinterlacing'];
+  if (v.hdr && !caps.hdr) return [false, 'HDR video on an SDR display needs tone mapping'];
+  if (v.hdr === 'dv' && !caps.dolbyVision && !caps.hdr) return [false, 'Dolby Vision needs tone mapping'];
+  if (caps.maxHeight && classHeight(v) > caps.maxHeight * 1.05) return [false, 'resolution is higher than this device supports'];
+  return [true];
+}
+
+export function pickDefaultTracks(media, prefs = {}) {
+  const audio = media.audio;
+  const langMatch = (t, lang) => lang && t.language && t.language.toLowerCase().startsWith(lang.toLowerCase().slice(0, 2));
+  const a = audio.find((t) => langMatch(t, prefs.audioLanguage)) || audio.find((t) => t.default) || audio[0] || null;
+  let s = null;
+  const mode = prefs.subtitleMode || 'forced';
+  const subs = media.subtitles;
+  if (mode === 'always') s = subs.find((t) => langMatch(t, prefs.subtitleLanguage) && !t.forced) || subs.find((t) => langMatch(t, prefs.subtitleLanguage));
+  else if (mode === 'forced') s = subs.find((t) => t.forced && (langMatch(t, a?.language) || langMatch(t, prefs.subtitleLanguage)));
+  return { audioIndex: a?.index ?? null, subtitleIndex: s?.index ?? null };
+}
+
+/**
+ * @param media     parsed media_files row
+ * @param opts      { caps, audioIndex, subtitleIndex, quality, maxBitrate, bandwidth, forceMode, settings }
+ */
+export function decide(media, opts) {
+  const { caps = {}, settings } = opts;
+  const reasons = [];
+  const audio = media.audio.find((a) => a.index === opts.audioIndex) || media.audio[0] || null;
+  const sub = media.subtitles.find((s) => String(s.index) === String(opts.subtitleIndex)) || null;
+  const burn = !!(sub && !sub.text);
+
+  const [vOk, vWhy] = videoSupported(media.video, caps);
+  if (!vOk) reasons.push(vWhy);
+  if (burn) reasons.push('picture-based subtitles must be burned in');
+
+  const audioOk = !audio || !!caps.audio?.[audio.codec];
+  const audioIsFirst = !audio || media.audio[0]?.index === audio.index;
+  const containerKind = DIRECT_CONTAINERS[media.container];
+  const containerOk = !!containerKind && !!caps.containers?.[containerKind];
+
+  // Bandwidth budget. "original" quality means: never reduce quality, even if it may buffer.
+  const userCap = opts.maxBitrate > 0 ? opts.maxBitrate : Infinity;
+  const netCap = opts.quality === 'original' || !(opts.bandwidth > 0) ? Infinity : opts.bandwidth * 0.85;
+  const budget = Math.min(userCap, netCap);
+  // Files have peaks well above their average bitrate; leave headroom.
+  const fits = (media.bitrate || 0) * 1.2 <= budget;
+  if (!fits) reasons.push(`file bitrate ${(media.bitrate / 1e6).toFixed(1)} Mbps exceeds the ${(budget / 1e6).toFixed(1)} Mbps budget`);
+
+  const explicitQuality = opts.quality && !['auto', 'original'].includes(opts.quality);
+  if (explicitQuality) reasons.push(`${opts.quality} quality selected`);
+
+  let mode;
+  if (opts.forceMode === 'transcode' || burn || !vOk || !fits || explicitQuality) mode = 'transcode';
+  else if (opts.forceMode === 'remux') mode = 'remux';
+  else if (containerOk && audioOk && audioIsFirst) mode = 'direct';
+  else mode = 'remux';
+
+  if (mode === 'remux' && !caps.progressiveRemux) {
+    // Safari can't play an unbounded progressive stream; give it HLS instead.
+    mode = 'transcode';
+    reasons.push('this browser needs HLS for converted streams');
+  }
+
+  if (mode === 'remux') {
+    if (!containerOk) reasons.push(`${media.container.toUpperCase()} container isn't playable directly – repackaging`);
+    if (!audioOk) reasons.push(`${audio.codec} audio isn't supported – converting audio only`);
+    else if (!audioIsFirst) reasons.push('alternate audio track selected');
+  }
+
+  const audioCopy = !!audio && audioOk && MP4_AUDIO.has(audio.codec);
+  return {
+    mode,
+    reasons,
+    audio,
+    subtitle: sub,
+    burnSubtitle: burn ? sub : null,
+    audioCopy,
+    budget: Number.isFinite(budget) ? budget : null,
+    ladder:
+      mode === 'transcode'
+        ? buildLadder(media, { hwaccel: settings.hwaccel, maxSoftwareHeight: settings.maxSoftwareHeight, maxHeight: caps.maxHeight })
+        : null,
+  };
+}

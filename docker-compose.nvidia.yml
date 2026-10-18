@@ -1,0 +1,17 @@
+# NVIDIA NVENC transcoding. Requires the NVIDIA Container Toolkit on the host:
+# https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+services:
+  streamarr:
+    runtime: nvidia
+    environment:
+      HWACCEL: nvenc
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,video,utility
+      MAX_SOFTWARE_HEIGHT: 2160
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu, video]

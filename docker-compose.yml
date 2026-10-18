@@ -1,0 +1,41 @@
+# Streamarr – self-hosted streaming for your own media.
+#
+#   cp .env.example .env      # set MEDIA_DIR (and PUID/PGID) first
+#   docker compose up -d --build
+#
+# GPU transcoding: add one of the override files, e.g.
+#   docker compose -f docker-compose.yml -f docker-compose.vaapi.yml up -d --build
+#   docker compose -f docker-compose.yml -f docker-compose.nvidia.yml up -d --build
+
+services:
+  streamarr:
+    build: .
+    image: streamarr:latest
+    container_name: streamarr
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8420}:8420"
+    # Run as the user that owns your media files (see `id` on the host).
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      TZ: ${TZ:-UTC}
+      TMDB_API_KEY: ${TMDB_API_KEY:-}
+      HWACCEL: ${HWACCEL:-none}
+      TRANSCODE_PRESET: ${TRANSCODE_PRESET:-veryfast}
+      MAX_SOFTWARE_HEIGHT: ${MAX_SOFTWARE_HEIGHT:-1080}
+    volumes:
+      - ${CONFIG_DIR:-./data}:/config
+      # Your media, read-only. Add more lines for more drives, all under /media.
+      - ${MEDIA_DIR:-/srv/media}:/media:ro
+    # Transcode scratch space in RAM: fast, and spares your SSD. Old segments are pruned
+    # automatically (~400 MB per active stream at most).
+    tmpfs:
+      - /transcode:size=${TRANSCODE_TMPFS_SIZE:-4g},mode=1777
+    # Direct play and remux are cheap; this caps a runaway transcode, not normal use.
+    ulimits:
+      nofile: 65536
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

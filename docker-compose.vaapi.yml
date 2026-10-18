@@ -1,0 +1,13 @@
+# Intel Quick Sync / AMD GPU transcoding via VAAPI.
+# Find your render group id on the host:  getent group render | cut -d: -f3
+services:
+  streamarr:
+    devices:
+      - /dev/dri:/dev/dri
+    group_add:
+      - "${RENDER_GID:-105}"
+      - "${VIDEO_GID:-44}"
+    environment:
+      HWACCEL: vaapi
+      VAAPI_DEVICE: ${VAAPI_DEVICE:-/dev/dri/renderD128}
+      MAX_SOFTWARE_HEIGHT: 2160

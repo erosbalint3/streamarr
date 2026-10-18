@@ -1,0 +1,582 @@
+import Hls from 'hls.js';
+import { api } from '../api.js';
+import { detectCaps, measureBandwidth } from './caps.js';
+
+export { detectCaps, measureBandwidth };
+
+// ------------------------------------------------------------ subtitles
+
+const vttTime = (s) => {
+  const m = /(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{1,3})/.exec(s);
+  return m ? Number(m[1] || 0) * 3600 + Number(m[2]) * 60 + Number(m[3]) + Number(m[4].padEnd(3, '0')) / 1000 : 0;
+};
+
+export function parseVtt(text) {
+  const cues = [];
+  for (const block of text.replace(/\r/g, '').split(/\n\n+/)) {
+    const lines = block.split('\n');
+    const i = lines.findIndex((l) => l.includes('-->'));
+    if (i < 0) continue;
+    const [a, b] = lines[i].split('-->');
+    const body = lines.slice(i + 1).join('\n').trim();
+    if (body) cues.push({ start: vttTime(a), end: vttTime(b.trim().split(/\s+/)[0]), text: body });
+  }
+  return cues.sort((x, y) => x.start - y.start);
+}
+
+export function cueHtml(text) {
+  const esc = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return esc
+    .replace(/&lt;(\/?)(i|b|u)&gt;/g, '<$1$2>')
+    .replace(/&lt;[^&]*?&gt;/g, '')
+    .replace(/\{\\[^}]*\}/g, '')
+    .replace(/\n/g, '<br>');
+}
+
+// ------------------------------------------------------------ playback controller
+
+// Remux via MSE: how far ahead we pull the stream, and how much played data we keep for quick back-seeks.
+const MSE_MAX_AHEAD = 150;
+const MSE_BACK_KEEP = 60;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** Codec string for the fragmented MP4 the server remuxes, or null if MSE can't take it. */
+export function remuxMime(source) {
+  const v = source?.video;
+  const a = source?.audio;
+  if (!v) return null;
+  let vc;
+  if (v.codec === 'h264') {
+    const prof = { baseline: '42', 'constrained baseline': '42', main: '4d', high: '64', 'high 10': '6e', 'high 4:2:2': '7a' }[(v.profile || 'high').toLowerCase()] || '64';
+    vc = `avc1.${prof}00${Math.max(10, Number(v.level) || 40).toString(16).padStart(2, '0')}`;
+  } else if (v.codec === 'hevc') {
+    const main10 = /10/.test(v.profile || '') || v.bitDepth > 8;
+    vc = `hvc1.${main10 ? 2 : 1}.${main10 ? 4 : 6}.L${Number(v.level) > 0 ? v.level : 120}.B0`;
+  } else if (v.codec === 'av1') vc = `av01.0.08M.${v.bitDepth > 8 ? '10' : '08'}`;
+  else if (v.codec === 'vp9') vc = v.bitDepth > 8 ? 'vp09.02.40.10' : 'vp09.00.40.08';
+  else return null;
+  let ac = null;
+  if (a) {
+    ac = { aac: 'mp4a.40.2', mp3: 'mp4a.6B', ac3: 'ac-3', eac3: 'ec-3', opus: 'opus', flac: 'flac', alac: 'alac' }[a.copy ? a.codec : 'aac'];
+    if (!ac) return null;
+  }
+  const mime = `video/mp4; codecs="${[vc, ac].filter(Boolean).join(',')}"`;
+  const MS = window.ManagedMediaSource || window.MediaSource;
+  return MS?.isTypeSupported?.(mime) ? mime : null;
+}
+
+const HLS_CONFIG = {
+  // Keep a deep forward buffer: this is what rides out Wi-Fi dips and congested links.
+  maxBufferLength: 90,
+  maxMaxBufferLength: 600,
+  maxBufferSize: 400 * 1000 * 1000,
+  backBufferLength: 60,
+  maxBufferHole: 0.5,
+  nudgeMaxRetry: 10,
+  startFragPrefetch: true,
+  enableWorker: true,
+  lowLatencyMode: false,
+  capLevelToPlayerSize: false,
+  // Be conservative when stepping up, quick to step down.
+  abrBandWidthFactor: 0.85,
+  abrBandWidthUpFactor: 0.65,
+  // After a seek the server may need a moment to start encoding at the new position.
+  fragLoadPolicy: {
+    default: {
+      maxTimeToFirstByteMs: 50000,
+      maxLoadTimeMs: 120000,
+      timeoutRetry: { maxNumRetry: 3, retryDelayMs: 0, maxRetryDelayMs: 0 },
+      errorRetry: { maxNumRetry: 8, retryDelayMs: 1000, maxRetryDelayMs: 8000 },
+    },
+  },
+};
+
+export class Playback extends EventTarget {
+  constructor(video) {
+    super();
+    this.video = video;
+    this.hls = null;
+    this.data = null;
+    this.offset = 0;
+    this.base = 0; // added to video.currentTime to get file time (progressive remux starts at 0)
+    this.mse = null;
+    this.opts = {};
+    this.stalls = 0;
+    this.recentStalls = [];
+    this.stallStart = null;
+    this.seeking = false;
+    this.bandwidth = 0;
+    this.server = null;
+    this.capped = false;
+    this.destroyed = false;
+    this._timers = [];
+    this._bind();
+  }
+
+  emit(type, detail) {
+    this.dispatchEvent(new CustomEvent(type, { detail }));
+  }
+
+  _bind() {
+    const v = this.video;
+    const on = (ev, fn) => {
+      v.addEventListener(ev, fn);
+      this._timers.push(() => v.removeEventListener(ev, fn));
+    };
+    on('seeking', () => (this.seeking = true));
+    on('seeked', () => {
+      this.seeking = false;
+      this.stallStart = null;
+    });
+    on('waiting', () => {
+      if (!this.seeking && !v.paused && this.stallStart == null) this.stallStart = performance.now();
+    });
+    const resolved = () => {
+      this.seeking = false;
+      if (this.stallStart != null) {
+        const ms = performance.now() - this.stallStart;
+        if (ms > 1000) {
+          this.stalls++;
+          this.recentStalls.push(Date.now());
+          this._onStall(ms);
+        }
+        this.stallStart = null;
+      }
+    };
+    on('playing', resolved);
+    on('timeupdate', () => {
+      if (this.stallStart != null && v.readyState >= 3) resolved();
+    });
+    on('pause', () => this.report());
+
+    const watchdog = setInterval(() => this._watchdog(), 1000);
+    const reporter = setInterval(() => this.report(), 10000);
+    this._timers.push(() => clearInterval(watchdog), () => clearInterval(reporter));
+  }
+
+  get mode() {
+    return this.data?.mode;
+  }
+  get currentTime() {
+    return this.base + (this.video.currentTime || 0);
+  }
+  get duration() {
+    return this.data?.duration || 0;
+  }
+
+  bufferedAhead() {
+    const v = this.video;
+    for (let i = 0; i < v.buffered.length; i++) {
+      if (v.buffered.start(i) <= v.currentTime + 0.3 && v.buffered.end(i) >= v.currentTime) return v.buffered.end(i) - v.currentTime;
+    }
+    return 0;
+  }
+
+  /** Buffered ranges in absolute (file) time, for the seek bar. */
+  bufferedRanges() {
+    const v = this.video;
+    const off = this.base;
+    const out = [];
+    for (let i = 0; i < v.buffered.length; i++) out.push([v.buffered.start(i) + off, v.buffered.end(i) + off]);
+    return out;
+  }
+
+  async load(opts) {
+    this.opts = { ...this.opts, ...opts };
+    const caps = detectCaps();
+    if (!this.bandwidth) this.bandwidth = await measureBandwidth();
+    const body = {
+      caps,
+      bandwidth: this.bandwidth,
+      quality: this.opts.quality,
+      maxBitrate: this.opts.maxBitrate,
+      forceMode: this.opts.forceMode,
+      startPosition: this.opts.startPosition,
+      client: clientName(),
+      replaceSession: this.data?.sessionId,
+    };
+    if (this.opts.audioIndex !== undefined) body.audioIndex = this.opts.audioIndex;
+    if (this.opts.subtitleIndex !== undefined) body.subtitleIndex = this.opts.subtitleIndex === 'off' ? null : this.opts.subtitleIndex;
+    const data = await api.post(`/api/playback/${this.opts.itemId}/start`, body);
+    if (this.destroyed) {
+      navigator.sendBeacon?.(`/api/playback/session/${data.sessionId}/stop`, JSON.stringify({}));
+      return;
+    }
+    this.data = data;
+    this.offset = data.offset || 0;
+    this.capped = false;
+    this.recentStalls = [];
+    this._attach(data.url, data.startPosition);
+    this.emit('session', data);
+    return data;
+  }
+
+  _destroyHls() {
+    if (this.hls) {
+      this.hls.destroy();
+      this.hls = null;
+    }
+    if (this.mse) {
+      this.mse.gen++;
+      this.mse.ctrl?.abort();
+      URL.revokeObjectURL(this.mse.objUrl);
+      this.mse = null;
+    }
+  }
+
+  // ---------------------------------------------------------- remux through Media Source Extensions
+  // A plain <video src> on an endless progressive stream only buffers a few seconds in Chrome.
+  // Feeding the fMP4 stream into a SourceBuffer ourselves lets us keep minutes buffered,
+  // and the absolute timeline (timestampOffset) means the seek bar never needs offset math.
+
+  _startMse(url, offset, start, mime, play) {
+    const MS = window.ManagedMediaSource || window.MediaSource;
+    const ms = new MS();
+    const v = this.video;
+    if (window.ManagedMediaSource && MS === window.ManagedMediaSource) v.disableRemotePlayback = true;
+    const objUrl = URL.createObjectURL(ms);
+    this.mse = { ms, sb: null, gen: 0, ctrl: null, objUrl, lastTrim: 0 };
+    ms.addEventListener(
+      'sourceopen',
+      () => {
+        if (this.mse?.ms !== ms) return;
+        try {
+          ms.duration = this.duration;
+          const sb = ms.addSourceBuffer(mime);
+          sb.mode = 'segments';
+          this.mse.sb = sb;
+        } catch (e) {
+          this.emit('error', { message: `This browser rejected the stream (${e.message}).` });
+          return;
+        }
+        this._feed(url, offset);
+        v.currentTime = start || 0;
+        play();
+      },
+      { once: true }
+    );
+    v.src = objUrl;
+  }
+
+  _sbIdle(sb) {
+    return sb.updating ? new Promise((r) => sb.addEventListener('updateend', r, { once: true })) : Promise.resolve();
+  }
+
+  _mseAhead() {
+    return this.bufferedAhead();
+  }
+
+  async _append(sb, chunk, gen) {
+    const m = this.mse;
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await this._sbIdle(sb);
+      if (!m || gen !== m.gen) return;
+      try {
+        sb.appendBuffer(chunk);
+        await this._sbIdle(sb);
+        await this._trimBack(sb);
+        return;
+      } catch (e) {
+        if (e.name !== 'QuotaExceededError') throw e;
+        // Out of buffer memory: drop played data and wait for playback to catch up.
+        const cut = this.video.currentTime - 10;
+        if (cut > 0 && sb.buffered.length) {
+          sb.remove(0, cut);
+          await this._sbIdle(sb);
+        }
+        await sleep(1500);
+      }
+    }
+  }
+
+  async _trimBack(sb) {
+    const m = this.mse;
+    const now = performance.now();
+    if (!m || now - m.lastTrim < 20000 || !sb.buffered.length) return;
+    m.lastTrim = now;
+    const cut = this.video.currentTime - MSE_BACK_KEEP;
+    if (cut > sb.buffered.start(0) + 5) {
+      sb.remove(0, cut);
+      await this._sbIdle(sb);
+    }
+  }
+
+  async _feed(url, offset) {
+    const m = this.mse;
+    if (!m?.sb) return;
+    const gen = ++m.gen;
+    m.ctrl?.abort();
+    const ctrl = new AbortController();
+    m.ctrl = ctrl;
+    const sb = m.sb;
+    await this._sbIdle(sb);
+    if (gen !== m.gen) return;
+    try {
+      if (m.ms.readyState === 'open') sb.abort();
+      sb.timestampOffset = offset;
+    } catch {
+      /* ignore */
+    }
+    let reader;
+    try {
+      const res = await fetch(url, { signal: ctrl.signal, credentials: 'same-origin' });
+      if (!res.ok) throw new Error(`stream ${res.status}`);
+      reader = res.body.getReader();
+    } catch (e) {
+      if (e.name !== 'AbortError') this.emit('error', { message: 'The stream could not be started.' });
+      return;
+    }
+    let pending = [];
+    let pendingBytes = 0;
+    let lastFlush = performance.now();
+    const flush = async () => {
+      if (!pendingBytes) return;
+      const buf = new Uint8Array(pendingBytes);
+      let o = 0;
+      for (const c of pending) {
+        buf.set(c, o);
+        o += c.length;
+      }
+      pending = [];
+      pendingBytes = 0;
+      lastFlush = performance.now();
+      await this._append(sb, buf, gen);
+    };
+    try {
+      for (;;) {
+        // Backpressure: stop reading once we're far enough ahead; TCP then pauses the server's ffmpeg.
+        while (gen === m.gen && this._mseAhead() > MSE_MAX_AHEAD) await sleep(500);
+        if (gen !== m.gen) break;
+        const { done, value } = await reader.read();
+        if (gen !== m.gen) break;
+        if (done) {
+          await flush();
+          await this._sbIdle(sb);
+          if (gen === m.gen && m.ms.readyState === 'open') {
+            try {
+              m.ms.endOfStream();
+            } catch {
+              /* ignore */
+            }
+          }
+          return;
+        }
+        pending.push(value);
+        pendingBytes += value.length;
+        // Coalesce small network chunks; append quickly at startup so playback begins fast.
+        if (pendingBytes >= 1024 * 1024 || performance.now() - lastFlush > 250 || this._mseAhead() < 3) await flush();
+      }
+    } catch (e) {
+      if (e.name !== 'AbortError') console.warn('[remux] feed error', e);
+    }
+    try {
+      reader.cancel();
+    } catch {
+      /* ignore */
+    }
+  }
+
+  _attach(url, start) {
+    const v = this.video;
+    this._destroyHls();
+    const mode = this.data.mode;
+    const playWhenReady = () => {
+      const p = v.play();
+      p?.catch?.((e) => {
+        if (e?.name === 'NotAllowedError') this.emit('autoplay-blocked');
+      });
+    };
+
+    if (mode === 'transcode' && !detectCaps().hls) {
+      this.emit('error', { message: 'This browser can\'t play H.264 video or HLS streams. Try Chrome, Edge, Firefox or Safari.' });
+      return;
+    }
+    if (mode === 'transcode' && detectCaps().hls === 'mse') {
+      const hls = new Hls({
+        ...HLS_CONFIG,
+        startPosition: start || 0,
+        abrEwmaDefaultEstimate: this.bandwidth ? Math.round(this.bandwidth * 0.8) : 5_000_000,
+        startLevel: -1,
+      });
+      this.hls = hls;
+      hls.on(Hls.Events.LEVEL_SWITCHED, (_, d) => this.emit('level', { level: d.level }));
+      hls.on(Hls.Events.MANIFEST_PARSED, () => {
+        this.emit('levels', { levels: hls.levels });
+        playWhenReady();
+      });
+      let mediaRecoveries = 0;
+      hls.on(Hls.Events.ERROR, (_, d) => {
+        if (!d.fatal) return;
+        if (d.type === Hls.ErrorTypes.NETWORK_ERROR) {
+          setTimeout(() => this.hls === hls && hls.startLoad(), 1500);
+        } else if (d.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries++ < 3) {
+          hls.recoverMediaError();
+        } else {
+          this.emit('error', { message: `Playback failed (${d.details}).` });
+        }
+      });
+      hls.loadSource(url);
+      hls.attachMedia(v);
+      return;
+    }
+
+    if (mode === 'remux') {
+      const mime = remuxMime(this.data.source);
+      if (mime) {
+        this.base = 0;
+        this._startMse(url, this.offset, start, mime, playWhenReady);
+        return;
+      }
+      this.base = this.offset; // progressive fallback: the stream's clock starts at the keyframe
+    } else this.base = 0;
+
+    v.src = url;
+    const local = mode === 'remux' ? Math.max(0, (start || 0) - this.offset) : start || 0;
+    const onMeta = () => {
+      v.removeEventListener('loadedmetadata', onMeta);
+      if (local > 0.5) v.currentTime = local;
+      playWhenReady();
+    };
+    v.addEventListener('loadedmetadata', onMeta);
+    v.load();
+  }
+
+  async seek(t) {
+    t = Math.max(0, Math.min(t, this.duration - 0.5));
+    if (this.mode !== 'remux') {
+      this.video.currentTime = t;
+      return;
+    }
+    const local = t - this.base;
+    const inBuffer = this.bufferedRanges().some(([a, b]) => t >= a && t <= b - 0.5);
+    if (local >= 0 && inBuffer) {
+      this.video.currentTime = local;
+      return;
+    }
+    // Outside the buffered window: restart the remux at the nearest keyframe before t.
+    this.seeking = true;
+    this.emit('reloading');
+    if (this.mse) this.video.currentTime = t;
+    const r = await api.post(`/api/playback/session/${this.data.sessionId}/seek`, { position: t });
+    this.offset = r.offset;
+    if (this.mse) {
+      this._feed(r.url, r.offset);
+      return;
+    }
+    this._attach(r.url, t);
+  }
+
+  /** Re-negotiate the session at the current position with changed options. */
+  async reload(patch) {
+    const pos = this.currentTime;
+    const wasPaused = this.video.paused;
+    await this.load({ ...patch, startPosition: pos });
+    if (wasPaused) this.video.pause();
+  }
+
+  setQuality(q) {
+    this.opts.quality = q;
+    if (this.hls && q !== 'original') {
+      if (q === 'auto') {
+        this.hls.autoLevelCapping = -1;
+        this.hls.nextLevel = -1;
+        this.hls.currentLevel = -1;
+        return;
+      }
+      const idx = this.hls.levels.findIndex((l) => this.data.renditions.find((r) => r.id === q && r.height === l.height));
+      if (idx >= 0) {
+        this.hls.nextLevel = idx;
+        return;
+      }
+    }
+    if (q === 'auto' && this.mode !== 'transcode') return;
+    return this.reload({ quality: q, forceMode: q === 'original' ? undefined : q === 'auto' ? undefined : 'transcode' });
+  }
+
+  _onStall(ms) {
+    this.emit('stall', { ms, total: this.stalls });
+  }
+
+  _watchdog() {
+    if (!this.data || this.destroyed) return;
+    const now = Date.now();
+    this.recentStalls = this.recentStalls.filter((t) => now - t < 90000);
+    const longStall = this.stallStart != null && performance.now() - this.stallStart > 7000;
+    const choppy = this.recentStalls.length >= 3;
+    if (!longStall && !choppy) return;
+
+    if (this.mode !== 'transcode' && this.opts.quality !== 'original' && !this._fellBack) {
+      // The original file is too heavy for this connection: switch to adaptive streaming.
+      this._fellBack = true;
+      this.stallStart = null;
+      this.recentStalls = [];
+      this.emit('fallback', { reason: 'Switched to adaptive quality to stop buffering.' });
+      this.reload({ forceMode: 'transcode' });
+    } else if (this.hls && !this.capped && this.hls.currentLevel > 0) {
+      this.capped = true;
+      this.recentStalls = [];
+      this.hls.autoLevelCapping = this.hls.currentLevel - 1;
+      this.hls.nextLevel = this.hls.currentLevel - 1;
+      this.emit('fallback', { reason: 'Lowered quality to keep playback smooth.' });
+      setTimeout(() => {
+        if (this.hls) {
+          this.hls.autoLevelCapping = -1;
+          this.capped = false;
+        }
+      }, 120000);
+    }
+  }
+
+  async report() {
+    if (!this.data || this.destroyed) return;
+    const q = this.video.getVideoPlaybackQuality?.();
+    try {
+      const r = await api.post(`/api/playback/session/${this.data.sessionId}/progress`, {
+        position: this.currentTime,
+        paused: this.video.paused,
+        buffer: Math.round(this.bufferedAhead()),
+        bandwidth: this.hls?.bandwidthEstimate ? Math.round(this.hls.bandwidthEstimate) : this.bandwidth,
+        level: this.hls ? this.hls.currentLevel : null,
+        droppedFrames: q?.droppedVideoFrames ?? null,
+        stalls: this.stalls,
+      });
+      this.server = r.session;
+      this.emit('server', r.session);
+      // The server can't encode this rendition in real time and our buffer is draining: step down.
+      const t = r.session?.transcode;
+      if (this.hls && t?.running && t.speed && t.speed < 1.05 && this.bufferedAhead() < 20 && this.hls.currentLevel > 0 && !this.capped) {
+        this.capped = true;
+        this.hls.autoLevelCapping = this.hls.currentLevel - 1;
+        this.emit('fallback', { reason: 'The server is busy – lowered quality to avoid buffering.' });
+      }
+    } catch (e) {
+      if (e.status === 404) this.emit('expired');
+    }
+  }
+
+  stop() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    if (this.data) {
+      const body = JSON.stringify({ position: this.currentTime });
+      if (!navigator.sendBeacon?.(`/api/playback/session/${this.data.sessionId}/stop`, body)) {
+        fetch(`/api/playback/session/${this.data.sessionId}/stop`, { method: 'POST', body, keepalive: true, headers: { 'content-type': 'application/json' } }).catch(() => {});
+      }
+    }
+    this._destroyHls();
+    this._timers.forEach((f) => f());
+    try {
+      this.video.removeAttribute('src');
+      this.video.load();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+function clientName() {
+  const ua = navigator.userAgent;
+  const browser = /edg\//i.test(ua) ? 'Edge' : /chrome|crios/i.test(ua) ? 'Chrome' : /firefox|fxios/i.test(ua) ? 'Firefox' : /safari/i.test(ua) ? 'Safari' : 'Browser';
+  const os = /android/i.test(ua) ? 'Android' : /iphone|ipad/i.test(ua) ? 'iOS' : /mac os/i.test(ua) ? 'macOS' : /windows/i.test(ua) ? 'Windows' : /linux/i.test(ua) ? 'Linux' : '';
+  return `${browser}${os ? ` on ${os}` : ''}`;
+}
