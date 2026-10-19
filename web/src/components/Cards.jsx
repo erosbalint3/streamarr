@@ -73,6 +73,12 @@ export function PosterCard({ item }) {
     <Link to={`/item/${item.id}`} className="card card-poster">
       <div className="card-art">
         <Img src={item.poster} alt="" fallback={<TypePoster title={item.title} year={item.year} />} />
+        {item.posterIsFrame && (
+          <div className="frameposter" aria-hidden="true">
+            <span className="typeposter-title">{item.title}</span>
+            {item.year && <span className="typeposter-year">{item.year}</span>}
+          </div>
+        )}
         <Badge item={item} />
         <ProgressBar value={item.progress} />
       </div>

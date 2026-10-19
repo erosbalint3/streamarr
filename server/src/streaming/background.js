@@ -3,6 +3,21 @@ import { enqueue } from '../tasks.js';
 import { parseMedia } from './media.js';
 import { generateTrickplay } from './trickplay.js';
 import { extractAll } from './subtitles.js';
+import { resolveImage } from '../images.js';
+
+/**
+ * Make sure every movie/show/video has its poster and backdrop on disk (downloaded from TMDB,
+ * or a frame grabbed from the video) before anyone opens the library.
+ */
+export function queueArtwork() {
+  // Newest first: shows get updated_at bumped when episodes are added.
+  const rows = all(`SELECT id, title FROM items WHERE type IN ('movie','show','video') ORDER BY updated_at DESC`);
+  for (const r of rows) {
+    enqueue(`art:${r.id}`, `Artwork: ${r.title}`, async () => {
+      for (const kind of ['poster', 'backdrop']) await resolveImage(r.id, kind).catch(() => null);
+    }, { priority: true });
+  }
+}
 
 /** Queue low-priority prep work for newly scanned items (or everything missing it when ids is null). */
 export function queueBackgroundWork(itemIds = null) {

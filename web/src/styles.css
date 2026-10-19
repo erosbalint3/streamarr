@@ -809,6 +809,23 @@ select:focus {
   font-size: 13px;
   color: rgba(238, 234, 247, 0.65);
 }
+/* Title set over a frame grabbed from the video (no artwork available). Sits under the
+   TypePoster fallback's position so it only shows once the frame has loaded. */
+.frameposter {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  padding: 14px;
+  background: linear-gradient(to top, rgba(16, 14, 26, 0.92) 0%, rgba(16, 14, 26, 0.55) 38%, rgba(16, 14, 26, 0) 65%);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+.card-art img.is-loaded + .frameposter {
+  opacity: 1;
+}
 .typeposter-sm {
   padding: 12px 14px;
 }

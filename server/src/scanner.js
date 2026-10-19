@@ -6,7 +6,7 @@ import { limiter } from './util/proc.js';
 import { VIDEO_EXTS, parseMovieName, parseEpisode, sortTitle, isSample } from './util/naming.js';
 import { localArtForMovie, localArtForShow, localArtForSeason, localThumbForEpisode } from './images.js';
 import { enrichPending, tmdbEnabled } from './metadata/tmdb.js';
-import { queueBackgroundWork } from './streaming/background.js';
+import { queueBackgroundWork, queueArtwork } from './streaming/background.js';
 
 export const scanState = {
   running: false,
@@ -268,6 +268,7 @@ export async function scanAll({ libraryId = null, full = false } = {}) {
     for (const lib of libs) ids = ids.concat(await scanLibrary(lib, { full }));
     scanState.phase = 'Fetching metadata';
     await enrichPending(log).catch((e) => scanState.errors.push(`Metadata: ${e.message}`));
+    queueArtwork();
     queueBackgroundWork(ids);
   } catch (e) {
     scanState.errors.push(e.message);

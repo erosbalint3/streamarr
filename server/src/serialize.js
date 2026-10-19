@@ -50,7 +50,10 @@ export function card(item, ctx = {}) {
     runtime: item.runtime,
     genres: json(item.genres, []),
     overview: ctx.full ? item.overview : undefined,
-    poster: item.poster || item.type === 'season' ? img(item, 'poster') : null,
+    // Always a URL: without artwork the server serves a frame from the video itself.
+    poster: item.type === 'episode' ? null : img(item, 'poster'),
+    // Tells the UI the poster is a video frame, so it overlays the title like a real poster.
+    posterIsFrame: item.type !== 'episode' && item.type !== 'season' && !item.poster ? true : undefined,
     backdrop: img(item, 'backdrop'),
     logo: item.logo ? img(item, 'logo') : null,
     thumb: item.type === 'episode' || item.type === 'video' ? img(item, 'thumb') : null,

@@ -8,10 +8,15 @@ let paused = false;
 
 export const taskState = () => ({ running: running?.label || null, queued: queue.length, paused });
 
-export function enqueue(key, label, fn) {
+export function enqueue(key, label, fn, { priority = false } = {}) {
   if (keys.has(key)) return;
   keys.add(key);
-  queue.push({ key, label, fn });
+  const task = { key, label, fn, priority };
+  if (priority) {
+    // Ahead of normal work, but behind earlier priority tasks (keeps library order).
+    const i = queue.findIndex((t) => !t.priority);
+    queue.splice(i < 0 ? queue.length : i, 0, task);
+  } else queue.push(task);
   pump();
 }
 
@@ -22,7 +27,8 @@ export function setBackgroundPaused(v) {
 }
 
 async function pump() {
-  if (running || paused || !queue.length) return;
+  if (running || !queue.length) return;
+  if (paused && !queue[0].priority) return;
   running = queue.shift();
   try {
     await running.fn();

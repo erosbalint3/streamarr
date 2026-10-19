@@ -4,7 +4,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { config } from './config.js';
 import { get, json } from './db.js';
-import { exec } from './util/proc.js';
+import os from 'node:os';
+import { exec, limiter } from './util/proc.js';
 import { tonemapFilter } from './streaming/encoder.js';
 
 const inflight = new Map();
@@ -33,25 +34,68 @@ export function tmdbImage(ref) {
 }
 
 
-/** Grab a still frame from the video file. */
+// Frame grabs hit the disk hard (seek + decode); a library page can ask for dozens at once.
+const frameLimit = limiter(Math.max(2, Math.min(4, os.cpus().length)));
+const failed = new Map(); // out path -> time of last failure, so broken files aren't retried on every request
+const FRAME = {
+  poster: { at: 0.22, vf: 'crop=min(iw\\,ih*2/3):min(ih\\,iw*3/2),scale=400:600' },
+  backdrop: { at: 0.18, vf: 'scale=1280:-2' },
+  thumb: { at: 0.3, vf: 'scale=640:-2' },
+};
+
+/**
+ * Grab a representative still from the video. Decodes only keyframes around the target time and
+ * lets ffmpeg's thumbnail filter pick the most typical one, which skips black and fade frames.
+ */
 function generatedFrame(itemId, kind) {
   const out = path.join(config.imageCacheDir, 'gen', `${itemId}_${kind}.jpg`);
   return once(out, async () => {
     if (await exists(out)) return out;
+    if (Date.now() - (failed.get(out) || 0) < 30 * 60 * 1000) throw new Error('frame grab failed recently');
     const media = get('SELECT path, duration, video FROM media_files WHERE item_id = ?', itemId);
     if (!media) throw new Error('no media');
     const video = json(media.video, {});
-    const at = Math.max(1, (media.duration || 60) * (kind === 'thumb' ? 0.3 : 0.18));
-    const width = kind === 'backdrop' ? 1280 : 640;
-    await fsp.mkdir(path.dirname(out), { recursive: true });
+    const spec = FRAME[kind];
+    const at = Math.max(1, (media.duration || 60) * spec.at);
     const tonemap = video?.hdr ? `${tonemapFilter(video.hdr)},` : '';
-    await exec(
-      config.ffmpeg,
-      ['-hide_banner', '-loglevel', 'error', '-ss', String(at), '-i', media.path, '-frames:v', '1', '-vf', `${tonemap}scale=${width}:-2,format=yuvj420p`, '-q:v', '4', '-y', out],
-      { timeout: 60000, nice: true }
-    );
-    return out;
+    const tmp = `${out}.tmp.jpg`;
+    await fsp.mkdir(path.dirname(out), { recursive: true });
+    const grab = (fast) =>
+      exec(
+        config.ffmpeg,
+        [
+          '-hide_banner', '-loglevel', 'error',
+          ...(fast ? ['-skip_frame', 'nokey'] : []),
+          '-ss', String(at), '-i', media.path,
+          '-an', '-sn', '-dn',
+          '-vf', `${fast ? 'thumbnail=n=8,' : ''}${tonemap}${spec.vf},format=yuvj420p`,
+          '-frames:v', '1', '-q:v', '3', '-y', tmp,
+        ],
+        { timeout: 90000, nice: true }
+      );
+    try {
+      await frameLimit(async () => {
+        try {
+          await grab(true);
+        } catch {
+          await grab(false); // some files (e.g. short clips, odd GOPs) need a plain decode
+        }
+      });
+      await fsp.rename(tmp, out);
+      failed.delete(out);
+      return out;
+    } catch (e) {
+      failed.set(out, Date.now());
+      await fsp.rm(tmp, { force: true });
+      throw e;
+    }
   });
+}
+
+/** Item id whose video should stand in for a show/season without artwork. */
+function firstEpisodeOf(item) {
+  const col = item.type === 'season' ? 'parent_id' : 'show_id';
+  return get(`SELECT id FROM items WHERE ${col} = ? AND type = 'episode' ORDER BY season_number = 0, season_number, episode_number LIMIT 1`, item.id)?.id;
 }
 
 /**
@@ -69,11 +113,12 @@ export async function resolveImage(itemId, kind) {
     if (kind === 'backdrop' && item.show_id) ref = get('SELECT backdrop FROM items WHERE id = ?', item.show_id)?.backdrop;
   }
   if (!ref) {
+    if (kind === 'logo') return null;
     const playable = ['movie', 'episode', 'video'].includes(item.type);
-    if (playable && (kind === 'thumb' || kind === 'backdrop')) return generatedFrame(item.id, kind);
-    if (kind === 'backdrop' && (item.type === 'show' || item.type === 'season')) {
-      const ep = get("SELECT id FROM items WHERE show_id = ? AND type = 'episode' ORDER BY season_number, episode_number LIMIT 1", item.show_id || item.id);
-      if (ep) return generatedFrame(ep.id, 'backdrop');
+    if (playable) return generatedFrame(item.id, kind);
+    if (item.type === 'show' || item.type === 'season') {
+      const ep = firstEpisodeOf(item.type === 'season' && kind === 'backdrop' ? { id: item.show_id, type: 'show' } : item);
+      if (ep) return generatedFrame(ep, kind === 'thumb' ? 'backdrop' : kind);
     }
     return null;
   }
