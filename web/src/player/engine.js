@@ -257,7 +257,7 @@ export class Playback extends EventTarget {
     const objUrl = URL.createObjectURL(ms);
     const bps = Math.max(1e6, this.data?.source?.bitrate || 8e6);
     const limit = Math.max(12, Math.min(MSE_MAX_AHEAD, (MSE_BYTE_BUDGET * 8) / bps));
-    this.mse = { ms, sb: null, gen: 0, ctrl: null, objUrl, lastTrim: 0, limit };
+    this.mse = { ms, sb: null, gen: 0, ctrl: null, objUrl, limit };
     ms.addEventListener(
       'sourceopen',
       () => {
@@ -306,40 +306,19 @@ export class Playback extends EventTarget {
       try {
         sb.appendBuffer(chunk);
         await this._sbIdle(sb);
-        await this._trimBack(sb);
         return;
       } catch (e) {
         if (e.name !== 'QuotaExceededError') throw e;
-        // Learn the real capacity so the reader stops before hitting it next time.
+        // The browser already evicted everything it safely could (it never touches the group of
+        // pictures being played). Learn the real capacity so the reader stops before it next time,
+        // then wait – as long as it takes, e.g. while paused – for playback to make room.
+        // Removing data ourselves is unsafe: removal extends to the next keyframe, which in real
+        // films can be 10+ seconds away, i.e. past the playhead – that froze playback.
         const ahead = this._mseAhead();
         if (ahead > 4) m.limit = Math.max(8, Math.min(m.limit, ahead * 0.85));
-        const cut = this.video.currentTime - 3;
-        if (cut > 0 && sb.buffered.length && sb.buffered.start(0) < cut) {
-          try {
-            sb.remove(0, cut);
-            await this._sbIdle(sb);
-          } catch {
-            /* ignore */
-          }
-        }
-        // Wait for playback to consume some of the buffer (indefinitely while paused).
         const target = Math.max(4, ahead - 3);
         while (gen === m.gen && this._mseAhead() > target) await sleep(400);
       }
-    }
-  }
-
-  async _trimBack(sb) {
-    const m = this.mse;
-    const now = performance.now();
-    if (!m || now - m.lastTrim < 10000 || !sb.buffered.length) return;
-    m.lastTrim = now;
-    // Played data costs the same memory as data ahead; keep only a short stretch for quick rewinds.
-    const keep = Math.min(30, m.limit * 0.25);
-    const cut = this.video.currentTime - keep;
-    if (cut > sb.buffered.start(0) + 2) {
-      sb.remove(0, cut);
-      await this._sbIdle(sb);
     }
   }
 
@@ -587,6 +566,32 @@ export class Playback extends EventTarget {
     return this.reload({ quality: q, forceMode: undefined, capHeight: undefined });
   }
 
+  /**
+   * Safety net: the element is "waiting" although the data it needs is buffered (a decoder that
+   * lost sync after a buffer change, a tiny gap between fragments). Re-seeking to the current
+   * position re-syncs it – the same trick hls.js uses for its own streams.
+   */
+  _unstick() {
+    const v = this.video;
+    const stuck = !v.paused && !v.seeking && v.readyState < 3 && this.bufferedAhead() > 1.5;
+    if (!stuck) {
+      this._stuckTicks = 0;
+      return;
+    }
+    if (++this._stuckTicks < 2) return; // ~2 s
+    this._stuckTicks = -3; // give the nudge a few seconds before trying again
+    let t = v.currentTime;
+    // Inside a gap? Jump to the start of the next buffered range.
+    for (let i = 0; i < v.buffered.length; i++) {
+      if (v.buffered.start(i) > t && v.buffered.start(i) - t < 3) {
+        t = v.buffered.start(i);
+        break;
+      }
+    }
+    console.warn(`[player] decoder stuck at ${v.currentTime.toFixed(2)}s with data buffered – re-syncing`);
+    v.currentTime = t + 0.01;
+  }
+
   /** Automatic mode, single converted stream: restart one quality step lower. */
   stepDown(why) {
     if (this._steppingDown || this.data.fixedQuality) return;
@@ -606,6 +611,7 @@ export class Playback extends EventTarget {
 
   _watchdog() {
     if (!this.data || this.destroyed) return;
+    this._unstick();
     const now = Date.now();
     this.recentStalls = this.recentStalls.filter((t) => now - t < 90000);
     const longStall = this.stallStart != null && performance.now() - this.stallStart > 7000;
