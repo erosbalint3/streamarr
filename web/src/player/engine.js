@@ -205,6 +205,7 @@ export class Playback extends EventTarget {
     this.data = data;
     this.offset = data.offset || 0;
     this.capped = false;
+    this._hinted = false;
     this.recentStalls = [];
     this._attach(data.url, data.startPosition);
     this.emit('session', data);
@@ -474,23 +475,27 @@ export class Playback extends EventTarget {
     if (wasPaused) this.video.pause();
   }
 
+  /**
+   * auto     – adaptive: the original when it fits, otherwise hls.js picks from the ladder
+   * original – always the source quality
+   * 1080p…   – one fixed rendition; nothing switches it automatically
+   */
   setQuality(q) {
     this.opts.quality = q;
-    if (this.hls && q !== 'original') {
-      if (q === 'auto') {
+    this._fellBack = false;
+    if (q === 'auto') {
+      // Already adaptive: just hand control back to hls.js, no restart needed.
+      if (this.hls && !this.data.fixedQuality) {
+        this.capped = false;
         this.hls.autoLevelCapping = -1;
         this.hls.nextLevel = -1;
-        this.hls.currentLevel = -1;
         return;
       }
-      const idx = this.hls.levels.findIndex((l) => this.data.renditions.find((r) => r.id === q && r.height === l.height));
-      if (idx >= 0) {
-        this.hls.nextLevel = idx;
-        return;
-      }
+      if (this.mode !== 'transcode') return; // already playing the original
     }
-    if (q === 'auto' && this.mode !== 'transcode') return;
-    return this.reload({ quality: q, forceMode: q === 'original' ? undefined : q === 'auto' ? undefined : 'transcode' });
+    // Fixed qualities and "original" are decided by the server (it may play the file itself
+    // when the original is already within the chosen quality).
+    return this.reload({ quality: q, forceMode: undefined });
   }
 
   _onStall(ms) {
@@ -504,6 +509,14 @@ export class Playback extends EventTarget {
     const longStall = this.stallStart != null && performance.now() - this.stallStart > 7000;
     const choppy = this.recentStalls.length >= 3;
     if (!longStall && !choppy) return;
+
+    if (this.data.fixedQuality) {
+      if (!this._hinted) {
+        this._hinted = true;
+        this.emit('fallback', { reason: `${this.opts.quality} is buffering on this connection. Pick a lower quality or Automatic.` });
+      }
+      return;
+    }
 
     if (this.mode !== 'transcode' && this.opts.quality !== 'original' && !this._fellBack) {
       // The original file is too heavy for this connection: switch to adaptive streaming.
@@ -544,7 +557,7 @@ export class Playback extends EventTarget {
       this.emit('server', r.session);
       // The server can't encode this rendition in real time and our buffer is draining: step down.
       const t = r.session?.transcode;
-      if (this.hls && t?.running && t.speed && t.speed < 1.05 && this.bufferedAhead() < 20 && this.hls.currentLevel > 0 && !this.capped) {
+      if (this.hls && !this.data.fixedQuality && t?.running && t.speed && t.speed < 1.05 && this.bufferedAhead() < 20 && this.hls.currentLevel > 0 && !this.capped) {
         this.capped = true;
         this.hls.autoLevelCapping = this.hls.currentLevel - 1;
         this.emit('fallback', { reason: 'The server is busy – lowered quality to avoid buffering.' });

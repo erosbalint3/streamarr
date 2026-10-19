@@ -93,18 +93,27 @@ export function decide(media, opts) {
   const containerOk = !!containerKind && !!caps.containers?.[containerKind];
 
   // Bandwidth budget. "original" quality means: never reduce quality, even if it may buffer.
+  // Every quality this server can offer for this file (also feeds the player's quality menu).
+  const fullLadder = buildLadder(media, { hwaccel: settings.hwaccel, maxSoftwareHeight: settings.maxSoftwareHeight, maxHeight: caps.maxHeight });
+
+  // A fixed quality ("720p") picked by the user: one rendition, no adaptive switching.
+  const explicitQuality = !!opts.quality && !['auto', 'original'].includes(opts.quality);
+  const wantHeight = explicitQuality ? parseInt(opts.quality, 10) || 1080 : null;
+  const fixedRung = explicitQuality ? fullLadder.find((r) => parseInt(r.id, 10) <= wantHeight) || fullLadder[fullLadder.length - 1] : null;
+  // Already at or below the chosen quality? Then the original is the better stream.
+  const needsDownscale = !!fixedRung && (classHeight(media.video) > parseInt(fixedRung.id, 10) * 1.05 || (media.bitrate || 0) > fixedRung.bitrate * 1.5);
+  if (needsDownscale) reasons.push(`${fixedRung.id} selected`);
+
+  // Bandwidth budget. A user-picked quality ("original" or fixed) overrides the connection estimate.
   const userCap = opts.maxBitrate > 0 ? opts.maxBitrate : Infinity;
-  const netCap = opts.quality === 'original' || !(opts.bandwidth > 0) ? Infinity : opts.bandwidth * 0.85;
+  const netCap = opts.quality === 'original' || explicitQuality || !(opts.bandwidth > 0) ? Infinity : opts.bandwidth * 0.85;
   const budget = Math.min(userCap, netCap);
   // Files have peaks well above their average bitrate; leave headroom.
   const fits = (media.bitrate || 0) * 1.2 <= budget;
   if (!fits) reasons.push(`file bitrate ${(media.bitrate / 1e6).toFixed(1)} Mbps exceeds the ${(budget / 1e6).toFixed(1)} Mbps budget`);
 
-  const explicitQuality = opts.quality && !['auto', 'original'].includes(opts.quality);
-  if (explicitQuality) reasons.push(`${opts.quality} quality selected`);
-
   let mode;
-  if (opts.forceMode === 'transcode' || burn || !vOk || !fits || explicitQuality) mode = 'transcode';
+  if (opts.forceMode === 'transcode' || burn || !vOk || !fits || needsDownscale) mode = 'transcode';
   else if (opts.forceMode === 'remux') mode = 'remux';
   else if (containerOk && audioOk && audioIsFirst) mode = 'direct';
   else mode = 'remux';
@@ -121,6 +130,14 @@ export function decide(media, opts) {
     else if (!audioIsFirst) reasons.push('alternate audio track selected');
   }
 
+  // Which renditions to offer when converting: the fixed one, the best one for "original"
+  // (when the file itself can't be played), or the whole adaptive ladder.
+  let ladder = null;
+  if (mode === 'transcode') {
+    const lock = fixedRung || (opts.quality === 'original' ? fullLadder[0] : null);
+    ladder = lock ? [lock] : fullLadder;
+  }
+
   const audioCopy = !!audio && audioOk && MP4_AUDIO.has(audio.codec);
   return {
     mode,
@@ -130,9 +147,8 @@ export function decide(media, opts) {
     burnSubtitle: burn ? sub : null,
     audioCopy,
     budget: Number.isFinite(budget) ? budget : null,
-    ladder:
-      mode === 'transcode'
-        ? buildLadder(media, { hwaccel: settings.hwaccel, maxSoftwareHeight: settings.maxSoftwareHeight, maxHeight: caps.maxHeight })
-        : null,
+    ladder,
+    fixed: mode === 'transcode' && ladder.length === 1,
+    qualities: fullLadder,
   };
 }

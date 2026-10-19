@@ -19,11 +19,14 @@ export default function Stats({ data, pb, server, level, onClose }) {
   const buffer = pb?.bufferedAhead() || 0;
   const bw = pb?.hls?.bandwidthEstimate || pb?.bandwidth;
   const t = server?.transcode;
-  const [title, desc] = MODE[data.mode];
+  const [title, desc] =
+    data.mode === 'transcode' && data.fixedQuality
+      ? ['Converted', `Converted to the fixed ${data.renditions[0].id} quality you picked. Quality won't change on its own.`]
+      : MODE[data.mode];
 
   const rows = [
     ['Source', `${data.source.container?.toUpperCase()} · ${v.codec} ${v.width}×${v.height}${v.hdr ? ` ${v.hdr.toUpperCase()}` : ''} · ${formatBitrate(data.source.bitrate)}`],
-    ['Video out', data.mode === 'transcode' ? (level ? `H.264 ${level.width}×${level.height} · ${formatBitrate(level.bitrate)}` : 'Selecting…') : `${v.codec} (original)`],
+    ['Video out', data.mode === 'transcode' ? (level || data.fixedQuality ? `H.264 ${(level || data.renditions[0]).width}×${(level || data.renditions[0]).height} · ${formatBitrate((level || data.renditions[0]).bitrate)}` : 'Selecting…') : `${v.codec} (original)`],
     ['Audio out', data.source.audio ? (data.mode === 'direct' || data.source.audio.copy && data.mode === 'remux' ? `${data.source.audio.codec} ${data.source.audio.channels}ch (original)` : `AAC (converted from ${data.source.audio.codec})`) : 'None'],
     ['Connection', bw ? `${formatBitrate(bw)} estimated` : 'Measuring…'],
     ['Buffer ahead', `${buffer.toFixed(0)} s`],

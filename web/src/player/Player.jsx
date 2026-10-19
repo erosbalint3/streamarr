@@ -10,6 +10,7 @@ import {
 } from '../components/Icons.jsx';
 
 const MODE_LABEL = { direct: 'Direct play', remux: 'Direct stream', transcode: 'Adaptive' };
+const modeLabel = (d) => (d.mode === 'transcode' && d.fixedQuality ? 'Converted' : MODE_LABEL[d.mode]);
 const SPEEDS = [0.75, 1, 1.25, 1.5, 2];
 
 function Menu({ title, children, onClose }) {
@@ -436,8 +437,8 @@ export default function Player() {
         )}
         {data && (
           <button className={`mode-pill mode-${data.mode}`} onClick={() => setStats((s) => !s)} title="Playback info (i)">
-            {MODE_LABEL[data.mode]}
-            {data.mode === 'transcode' && currentLevel ? ` · ${currentLevel.height}p` : ''}
+            {modeLabel(data)}
+            {data.mode === 'transcode' ? (data.fixedQuality ? ` · ${data.renditions[0].id}` : currentLevel ? ` · ${currentLevel.height}p` : '') : ''}
           </button>
         )}
       </div>
@@ -565,13 +566,13 @@ export default function Player() {
             </button>
             {menu === 'quality' && data && (
               <Menu title="Quality" onClose={() => setMenu(null)}>
-                <Option on={quality === 'auto'} onClick={() => chooseQuality('auto')} hint={data.mode === 'transcode' && quality === 'auto' && currentLevel ? `${currentLevel.height}p now` : null}>
+                <Option on={quality === 'auto'} onClick={() => chooseQuality('auto')} hint={data.mode === 'transcode' && !data.fixedQuality && quality === 'auto' && currentLevel ? `${currentLevel.height}p now` : null}>
                   Automatic
                 </Option>
                 <Option on={quality === 'original'} onClick={() => chooseQuality('original')} hint={formatBitrate(data.source.bitrate)}>
                   Original
                 </Option>
-                {(data.renditions.length ? data.renditions : ['1080p', '720p', '480p'].map((id) => ({ id }))).map((r) => (
+                {data.qualities.map((r) => (
                   <Option key={r.id} on={quality === r.id} onClick={() => chooseQuality(r.id)} hint={r.bitrate ? formatBitrate(r.bitrate) : null}>
                     {r.id}
                   </Option>

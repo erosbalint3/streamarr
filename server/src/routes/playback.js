@@ -124,6 +124,8 @@ export default async function playbackRoutes(app) {
       duration: media.duration,
       segmentSeconds: segmentSeconds(),
       renditions: decision.ladder || [],
+      fixedQuality: decision.fixed,
+      qualities: decision.qualities.map((r) => ({ id: r.id, bitrate: r.bitrate, height: r.height })),
       ...trackLists(item.id, media, decision),
       trickplay: media.trickplay ? { ...media.trickplay, url: `/api/media/${item.id}/trickplay/{n}.jpg` } : null,
       chapters: media.chapters,
