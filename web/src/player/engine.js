@@ -147,7 +147,10 @@ export class Playback extends EventTarget {
       this.stallStart = null;
     });
     on('waiting', () => {
-      if (!this.seeking && !v.paused && this.stallStart == null) this.stallStart = performance.now();
+      if (!this.seeking && !v.paused && this.stallStart == null) {
+        this.stallStart = performance.now();
+        this.stallSnap = this._snapshot();
+      }
     });
     const resolved = () => {
       this.seeking = false;
@@ -156,7 +159,7 @@ export class Playback extends EventTarget {
         if (ms > 1000) {
           this.stalls++;
           this.recentStalls.push(Date.now());
-          this._onStall(ms);
+          this._onStall(ms, 'stall');
         }
         this.stallStart = null;
       }
@@ -257,7 +260,7 @@ export class Playback extends EventTarget {
     const objUrl = URL.createObjectURL(ms);
     const bps = Math.max(1e6, this.data?.source?.bitrate || 8e6);
     const limit = Math.max(12, Math.min(MSE_MAX_AHEAD, (MSE_BYTE_BUDGET * 8) / bps));
-    this.mse = { ms, sb: null, gen: 0, ctrl: null, objUrl, limit };
+    this.mse = { ms, sb: null, gen: 0, ctrl: null, objUrl, limit, mime };
     ms.addEventListener(
       'sourceopen',
       () => {
@@ -316,6 +319,7 @@ export class Playback extends EventTarget {
         // films can be 10+ seconds away, i.e. past the playhead – that froze playback.
         const ahead = this._mseAhead();
         if (ahead > 4) m.limit = Math.max(8, Math.min(m.limit, ahead * 0.85));
+        this.quotaHits = (this.quotaHits || 0) + 1;
         const target = Math.max(4, ahead - 3);
         while (gen === m.gen && this._mseAhead() > target) await sleep(400);
       }
@@ -330,6 +334,8 @@ export class Playback extends EventTarget {
   async _recoverFeed(gen, reason, rebuild) {
     const m = this.mse;
     if (!m || gen !== m.gen || this.destroyed) return;
+    this.recoveries = (this.recoveries || 0) + 1;
+    this._sendDiag(`recover (${reason})`, 0);
     m.retries = (m.retries || 0) + 1;
     if (m.retries > 6) {
       this.emit('error', { message: `The stream keeps dropping (${reason}).` });
@@ -589,6 +595,8 @@ export class Playback extends EventTarget {
       }
     }
     console.warn(`[player] decoder stuck at ${v.currentTime.toFixed(2)}s with data buffered – re-syncing`);
+    this.nudges = (this.nudges || 0) + 1;
+    this._sendDiag('nudge', this.stallStart ? performance.now() - this.stallStart : 0);
     v.currentTime = t + 0.01;
   }
 
@@ -605,12 +613,57 @@ export class Playback extends EventTarget {
     this.reload({ capHeight: lower.height }).finally(() => (this._steppingDown = false));
   }
 
-  _onStall(ms) {
+  /** Playback state worth knowing when something goes wrong (sent to the server log). */
+  _snapshot() {
+    const v = this.video;
+    const near = this.bufferedRanges()
+      .filter(([a, b]) => b > this.currentTime - 30 && a < this.currentTime + 200)
+      .map(([a, b]) => `${a.toFixed(1)}-${b.toFixed(1)}`);
+    const fr = this._frames || [];
+    const first = fr[0];
+    const last = fr[fr.length - 1];
+    const recentTotal = first && last ? last.total - first.total : 0;
+    return {
+      position: +this.currentTime.toFixed(2),
+      readyState: v.readyState,
+      bufferAhead: +this.bufferedAhead().toFixed(1),
+      ranges: near.join(' '),
+      size: v.videoWidth ? `${v.videoWidth}x${v.videoHeight}` : null,
+      // Frames the browser could not decode in time over the last ~8 s: a struggling decoder.
+      droppedRecent: first && last ? `${last.dropped - first.dropped}/${recentTotal}` : null,
+      fps: first && last && last.t > first.t ? +((recentTotal * 1000) / (last.t - first.t)).toFixed(1) : null,
+      mime: this.mse?.mime || (this.hls ? 'hls' : 'progressive'),
+      limit: this.mse ? Math.round(this.mse.limit) : null,
+      quotaHits: this.quotaHits || 0,
+      nudges: this.nudges || 0,
+      recoveries: this.recoveries || 0,
+      level: this.hls ? this.hls.currentLevel : null,
+    };
+  }
+
+  _sendDiag(kind, ms) {
+    if (!this.data) return;
+    const body = { kind, ms: Math.round(ms || 0), stalls: this.stalls, client: navigator.userAgent, ...(this.stallSnap || this._snapshot()), now: this._snapshot() };
+    api.post(`/api/playback/session/${this.data.sessionId}/diag`, body).catch(() => {});
+  }
+
+  _onStall(ms, kind) {
+    this._sendDiag(kind, ms);
     this.emit('stall', { ms, total: this.stalls });
   }
 
   _watchdog() {
     if (!this.data || this.destroyed) return;
+    const q = this.video.getVideoPlaybackQuality?.();
+    if (q) {
+      this._frames = (this._frames || []).concat({ t: performance.now(), dropped: q.droppedVideoFrames, total: q.totalVideoFrames }).slice(-9);
+    }
+    // A stall still going on after 6 s: report it now, before any fallback changes the picture.
+    if (this.stallStart != null && !this._freezeSent && performance.now() - this.stallStart > 6000) {
+      this._freezeSent = true;
+      this._sendDiag('freeze', performance.now() - this.stallStart);
+    }
+    if (this.stallStart == null) this._freezeSent = false;
     this._unstick();
     const now = Date.now();
     this.recentStalls = this.recentStalls.filter((t) => now - t < 90000);

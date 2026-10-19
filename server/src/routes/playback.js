@@ -6,7 +6,7 @@ import { requireUser } from '../auth.js';
 import { getItem, card } from '../serialize.js';
 import { mediaForItem, audioLabel, subtitleLabel } from '../streaming/media.js';
 import { decide, pickDefaultTracks } from '../streaming/decision.js';
-import { keyframeBefore } from '../util/ffprobe.js';
+import { keyframeBefore, inspectAround } from '../util/ffprobe.js';
 import { createSession, getSession, stopSession, masterPlaylist, mediaPlaylist, getSegment, startRemux, sessionSummary, segmentSeconds } from '../streaming/sessions.js';
 import { adjacentEpisode } from './library.js';
 
@@ -168,15 +168,7 @@ export default async function playbackRoutes(app) {
     s.position = position;
     s.paused = !!b.paused;
     s.stats = { buffer: b.buffer, bandwidth: b.bandwidth, level: b.level, dropped: b.droppedFrames };
-    if (b.stalls != null && Number(b.stalls) > s.stalls) {
-      // Logged so `docker logs streamarr` shows what was going on when playback stopped.
-      const t = sessionSummary(s).transcode;
-      console.warn(
-        `[playback] stall #${b.stalls} – ${s.username} · "${s.title}" · ${s.mode} at ${Math.round(position)}s · client buffer ${b.buffer ?? '?'}s · ` +
-          `connection ${b.bandwidth ? (b.bandwidth / 1e6).toFixed(0) + ' Mbps' : '?'}${t ? ` · encoder ${t.speed ?? '?'}x (${t.level})` : ''} · load ${os.loadavg()[0].toFixed(1)}`
-      );
-      s.stalls = Number(b.stalls);
-    }
+    if (b.stalls != null) s.stalls = Math.max(s.stalls, Number(b.stalls));
 
     const duration = s.media.duration;
     const watched = duration > 0 && position / duration >= 0.92;
@@ -197,6 +189,35 @@ export default async function playbackRoutes(app) {
       position > 60 && !watched ? 1 : 0
     );
     return { ok: true, watched, session: sessionSummary(s) };
+  });
+
+  // Detailed client report when playback stalls; written to the server log (docker logs).
+  app.post('/api/playback/session/:sid/diag', async (req, reply) => {
+    const s = getSession(req.params.sid);
+    if (!s) return reply.code(404).send({ error: 'Playback session expired.' });
+    const d = req.body || {};
+    const m = s.media;
+    const v = m.video;
+    const a = s.decision.audio;
+    const t = sessionSummary(s).transcode;
+    const browser = /edg\//i.test(d.client || '') ? 'Edge' : /firefox/i.test(d.client || '') ? 'Firefox' : /chrome/i.test(d.client || '') ? 'Chrome' : /safari/i.test(d.client || '') ? 'Safari' : 'browser';
+    console.warn(
+      `[playback] ${d.kind} ${d.ms ? `${(d.ms / 1000).toFixed(1)}s ` : ''}– ${s.username} · "${s.title}" · ${s.mode} · ${browser} (${s.client})\n` +
+        `  file:   ${m.container} · ${v.codec} ${v.profile || ''} ${v.width}x${v.height} ${v.bitDepth}-bit ${v.fps}fps${v.hdr ? ' ' + v.hdr : ''} · ${(m.bitrate / 1e6).toFixed(1)} Mbps · ` +
+        `audio ${a ? `${a.codec} ${a.channels}ch → ${s.decision.audioCopy ? 'copied' : 'AAC'}` : 'none'}\n` +
+        `  at:     ${d.position}s · readyState ${d.readyState} · buffer ahead ${d.bufferAhead}s · ranges [${d.ranges}]\n` +
+        `  client: ${d.size || '?'} · decoded ${d.fps ?? '?'} fps · dropped ${d.droppedRecent ?? '?'} (last 8 s) · ${d.mime}` +
+        `${d.limit != null ? ` · buffer limit ${d.limit}s · quota hits ${d.quotaHits}` : ''} · nudges ${d.nudges} · recoveries ${d.recoveries} · stalls ${d.stalls}\n` +
+        `  now:    ${d.now?.position}s · readyState ${d.now?.readyState} · buffer ahead ${d.now?.bufferAhead}s${t ? ` · encoder ${t.speed ?? '?'}x (${t.level})` : ''} · server load ${os.loadavg()[0].toFixed(1)}`
+    );
+    // Once a minute per session: check the source file around the stall for problems.
+    if (Number.isFinite(d.position) && (!s.lastInspect || Date.now() - s.lastInspect > 60000)) {
+      s.lastInspect = Date.now();
+      inspectAround(m.path, d.position, { startTime: v.startTime || 0, videoIndex: v.index, audioIndex: a?.index ?? null })
+        .then((r) => console.warn(`  ${r}`))
+        .catch((e) => console.warn(`  source check failed: ${e.message}`));
+    }
+    return { ok: true };
   });
 
   app.post('/api/playback/session/:sid/stop', async (req) => {
