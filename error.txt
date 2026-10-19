@@ -1,0 +1,10 @@
+  file:   mkv · h264 High 1920x1080 8-bit 23.976fps · 32.3 Mbps · audio eac3 6ch → AAC
+  at:     153.95s · readyState 1 · network 1 · buffer ahead 0s · ranges [216.4-261.7] · source open · MEDIA ERROR 3 PipelineStatus::PIPELINE_ERROR_DECODE: Error Domain=NSOSStatusErrorDomain Code=-12909 "(null)" (-12909): VTDecompressionOutputCallback
+  client: 1920x1080 · decoded 0 fps · dropped 0/0 (last 8 s) · video/mp4; codecs="avc1.640029,mp4a.40.2" · buffer limit 27s · quota hits 0 · nudges 0 · recoveries 1 · stalls 0
+  now:    153.95s · readyState 1 · buffer ahead 0s · server load 1.0
+  source 141.95-165.95s | video: 585 frames (~23.98 fps), keyframes at [141.43, 142.27, 142.98, 143.81, 144.64, 145.40, 146.23, 147.02, 147.86, 148.69, 148.77, 149.61, 150.44, 151.28, 152.11, 152.19, 153.03, 153.86, 154.45, 155.28, 156.11, 156.32, 157.16, 157.99, 158.82, 159.66, 159.91, 160.74, 161.12, 161.95, 162.79, 163.37, 164.21, 165.04, 165.79] (longest GOP 0.84s), no gaps | audio: 761 packets, no gaps | 1 packets without timestamps
+[playback] recover (Failed to execute 'appendBuffer' on 'SourceBuffer': The HTMLMediaElement.error attribute is not null.) – erosbalint · "Project Hail Mary" · remux · Chrome (Chrome on macOS)
+  file:   mkv · h264 High 1920x1080 8-bit 23.976fps · 32.3 Mbps · audio eac3 6ch → AAC
+  at:     163.3s · readyState 4 · network 1 · buffer ahead 27.2s · ranges [153.9-190.5] · source open · MEDIA ERROR 3 PipelineStatus::PIPELINE_ERROR_DECODE: Error Domain=NSOSStatusErrorDomain Code=-12909 "(null)" (-12909): VTDecompressionOutputCallback
+  client: 1920x1080 · decoded 24 fps · dropped 0/192 (last 8 s) · video/mp4; codecs="avc1.640029,mp4a.40.2" · buffer limit 27s · quota hits 0 · nudges 0 · recoveries 2 · stalls 0
+  now:    163.3s · readyState 4 · buffer ahead 27.2s · server load 0.8
