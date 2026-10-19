@@ -205,7 +205,8 @@ export default async function playbackRoutes(app) {
       `[playback] ${d.kind} ${d.ms ? `${(d.ms / 1000).toFixed(1)}s ` : ''}– ${s.username} · "${s.title}" · ${s.mode} · ${browser} (${s.client})\n` +
         `  file:   ${m.container} · ${v.codec} ${v.profile || ''} ${v.width}x${v.height} ${v.bitDepth}-bit ${v.fps}fps${v.hdr ? ' ' + v.hdr : ''} · ${(m.bitrate / 1e6).toFixed(1)} Mbps · ` +
         `audio ${a ? `${a.codec} ${a.channels}ch → ${s.decision.audioCopy ? 'copied' : 'AAC'}` : 'none'}\n` +
-        `  at:     ${d.position}s · readyState ${d.readyState} · buffer ahead ${d.bufferAhead}s · ranges [${d.ranges}]\n` +
+        `  at:     ${d.position}s · readyState ${d.readyState} · network ${d.networkState} · buffer ahead ${d.bufferAhead}s · ranges [${d.ranges}]` +
+        `${d.msState ? ` · source ${d.msState}` : ''}${d.error ? ` · MEDIA ERROR ${d.error}` : ''}\n` +
         `  client: ${d.size || '?'} · decoded ${d.fps ?? '?'} fps · dropped ${d.droppedRecent ?? '?'} (last 8 s) · ${d.mime}` +
         `${d.limit != null ? ` · buffer limit ${d.limit}s · quota hits ${d.quotaHits}` : ''} · nudges ${d.nudges} · recoveries ${d.recoveries} · stalls ${d.stalls}\n` +
         `  now:    ${d.now?.position}s · readyState ${d.now?.readyState} · buffer ahead ${d.now?.bufferAhead}s${t ? ` · encoder ${t.speed ?? '?'}x (${t.level})` : ''} · server load ${os.loadavg()[0].toFixed(1)}`

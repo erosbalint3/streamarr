@@ -144,9 +144,16 @@ export class Playback extends EventTarget {
     on('seeking', () => (this.seeking = true));
     on('seeked', () => {
       this.seeking = false;
+      // A re-sync nudge is part of the ongoing stall: keep its clock running so a stall that the
+      // nudge doesn't cure still escalates (restart the stream, then convert).
+      if (this._nudging) {
+        this._nudging = false;
+        return;
+      }
       this.stallStart = null;
     });
     on('waiting', () => {
+      if (this.sourceLoading) return; // a new stream starting up, not a stall
       if (!this.seeking && !v.paused && this.stallStart == null) {
         this.stallStart = performance.now();
         this.stallSnap = this._snapshot();
@@ -154,6 +161,11 @@ export class Playback extends EventTarget {
     });
     const resolved = () => {
       this.seeking = false;
+      if (this.sourceLoading) {
+        this.sourceLoading = false;
+        this.stallStart = null;
+        return;
+      }
       if (this.stallStart != null) {
         const ms = performance.now() - this.stallStart;
         if (ms > 1000) {
@@ -452,6 +464,9 @@ export class Playback extends EventTarget {
   }
 
   _attach(url, start) {
+    this.sourceLoading = true;
+    this.stallStart = null;
+    this.stallSnap = null;
     const v = this.video;
     this._destroyHls();
     const mode = this.data.mode;
@@ -595,6 +610,11 @@ export class Playback extends EventTarget {
       }
     }
     console.warn(`[player] decoder stuck at ${v.currentTime.toFixed(2)}s with data buffered – re-syncing`);
+    if (this.stallStart == null) {
+      this.stallStart = performance.now() - 2000;
+      this.stallSnap = this._snapshot();
+    }
+    this._nudging = true;
     this.nudges = (this.nudges || 0) + 1;
     this._sendDiag('nudge', this.stallStart ? performance.now() - this.stallStart : 0);
     v.currentTime = t + 0.01;
@@ -638,6 +658,9 @@ export class Playback extends EventTarget {
       nudges: this.nudges || 0,
       recoveries: this.recoveries || 0,
       level: this.hls ? this.hls.currentLevel : null,
+      error: v.error ? `${v.error.code} ${v.error.message || ''}`.trim() : null,
+      msState: this.mse?.ms?.readyState || null,
+      networkState: v.networkState,
     };
   }
 
@@ -681,6 +704,16 @@ export class Playback extends EventTarget {
 
     if (this.mode === 'transcode' && this.data.renditions.length === 1) {
       this.stepDown('Playback kept pausing to load');
+      return;
+    }
+    if (this.mse && (!this._rebuiltAt || Date.now() - this._rebuiltAt > 60000)) {
+      // First try a fresh stream at the same spot: it resets the browser's decoder and buffer,
+      // which fixes a stuck pipeline without paying for a server-side conversion.
+      this._rebuiltAt = Date.now();
+      this.stallStart = null;
+      this.recentStalls = [];
+      this.emit('fallback', { reason: 'Playback got stuck – restarting the stream.' });
+      this._recoverFeed(this.mse.gen, 'stalled', true);
       return;
     }
     if (this.mode !== 'transcode' && this.opts.quality !== 'original' && !this._fellBack) {
