@@ -155,6 +155,11 @@ export function remuxArgs({ media, audio, audioCopy, offset, stereo }) {
     '-map', `0:${v.index}`,
     '-c:v', 'copy',
     ...(v.codec === 'hevc' ? ['-tag:v', 'hvc1'] : []),
+    // Blu-ray H.264 re-sends its picture parameter sets mid-stream with different values. The MP4
+    // init segment only carries the first set, and strict hardware decoders (macOS VideoToolbox:
+    // PIPELINE_ERROR_DECODE -12909) reject the stream when they change. This makes them consistent
+    // without touching the picture (decoded frames are bit-identical).
+    ...(v.codec === 'h264' ? ['-bsf:v', 'h264_redundant_pps'] : []),
     ...audioArgs(audio, { copy: audioCopy, stereo }),
     '-sn', '-dn', '-map_metadata', '-1', '-map_chapters', '-1',
     '-max_muxing_queue_size', '4096',

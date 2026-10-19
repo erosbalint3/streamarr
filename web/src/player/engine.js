@@ -181,6 +181,7 @@ export class Playback extends EventTarget {
       if (this.stallStart != null && v.readyState >= 3) resolved();
     });
     on('pause', () => this.report());
+    on('error', () => this._onMediaError());
 
     const watchdog = setInterval(() => this._watchdog(), 1000);
     const reporter = setInterval(() => this.report(), 10000);
@@ -215,6 +216,15 @@ export class Playback extends EventTarget {
   }
 
   async load(opts) {
+    this._loadInFlight = (this._loadInFlight || 0) + 1;
+    try {
+      return await this._load(opts);
+    } finally {
+      this._loadInFlight--;
+    }
+  }
+
+  async _load(opts) {
     this.opts = { ...this.opts, ...opts };
     const caps = detectCaps();
     if (!this.bandwidth) this.bandwidth = await measureBandwidth();
@@ -354,11 +364,13 @@ export class Playback extends EventTarget {
       return;
     }
     await sleep(Math.min(5000, 400 * 2 ** (m.retries - 1)));
-    if (!this.mse || gen !== this.mse.gen || this.destroyed) return;
+    // A new stream is being negotiated (quality change, fallback…): this recovery is moot.
+    if (!this.mse || gen !== this.mse.gen || this.destroyed || this._loadInFlight) return;
+    const sid = this.data.sessionId;
     try {
       const pos = rebuild ? this.currentTime : this._bufferEnd();
-      const r = await api.post(`/api/playback/session/${this.data.sessionId}/seek`, { position: pos });
-      if (!this.mse || gen !== this.mse.gen) return;
+      const r = await api.post(`/api/playback/session/${sid}/seek`, { position: pos });
+      if (!this.mse || gen !== this.mse.gen || this._loadInFlight || this.data?.sessionId !== sid) return;
       this.offset = r.offset;
       if (rebuild) {
         const wasPaused = this.video.paused;
@@ -366,6 +378,7 @@ export class Playback extends EventTarget {
         if (wasPaused) this.video.pause();
       } else this._feed(r.url, r.offset);
     } catch (e) {
+      if (this._loadInFlight || this.data?.sessionId !== sid) return;
       if (e.status === 404) this.emit('expired');
       else this._recoverFeed(gen, e.message, rebuild);
     }
@@ -450,7 +463,8 @@ export class Playback extends EventTarget {
         if (pendingBytes >= 1024 * 1024 || performance.now() - lastFlush > 250 || this._mseAhead() < 3) await flush();
       }
     } catch (e) {
-      if (e.name !== 'AbortError' && gen === m.gen) {
+      // A media (decode) error makes every append fail – _onMediaError decides what to do then.
+      if (e.name !== 'AbortError' && gen === m.gen && !this.video.error) {
         console.warn('[remux] feed error', e);
         // Network hiccup: resume downloading after the buffered part. Broken buffer: rebuild it.
         this._recoverFeed(gen, e.message, !!e.fromAppend);
@@ -558,9 +572,11 @@ export class Playback extends EventTarget {
 
   /** Re-negotiate the session at the current position with changed options. */
   async reload(patch) {
-    const pos = this.currentTime;
-    const wasPaused = this.video.paused;
-    await this.load({ ...patch, startPosition: pos });
+    const { keepPlaying, ...opts } = patch;
+    const pos = opts.startPosition ?? this.currentTime;
+    // After a media error the element may report paused although the viewer never paused.
+    const wasPaused = !keepPlaying && this.video.paused;
+    await this.load({ ...opts, startPosition: pos });
     if (wasPaused) this.video.pause();
   }
 
@@ -620,6 +636,41 @@ export class Playback extends EventTarget {
     v.currentTime = t + 0.01;
   }
 
+  /**
+   * The browser's decoder rejected the original video (e.g. macOS VideoToolbox -12909 on some
+   * Blu-ray H.264). Get past it instead of stalling:
+   *   direct play   -> direct stream (the server repairs H.264 parameter sets on the way)
+   *   direct stream -> one fresh restart; if it fails again at the same spot, convert from here
+   *                    and switch back to the original ~45 s later, once past the bad section
+   */
+  _onMediaError() {
+    const v = this.video;
+    const err = v.error;
+    if (!err || this.destroyed || !this.data || this.hls || this.sourceLoading) return;
+    if (err.code !== 3 && err.code !== 4) return; // decode / unsupported data
+    // Browsers can fire several error events for one failure: handle each stream's failure once.
+    if (this._erroredSrc === v.currentSrc) return;
+    this._erroredSrc = v.currentSrc;
+    const pos = this.currentTime;
+    this._sendDiag(`media error ${err.code} (${this.mode})`, 0);
+    if (this.mode === 'direct') {
+      this.emit('fallback', { reason: 'Your browser couldn\'t decode this file directly – repairing the stream.' });
+      this.reload({ forceMode: 'remux', startPosition: pos, keepPlaying: true });
+      return;
+    }
+    if (this.mode === 'remux') {
+      const prev = this._decodeErr;
+      this._decodeErr = { pos, at: Date.now() };
+      if (!prev || Math.abs(pos - prev.pos) > 60 || Date.now() - prev.at > 5 * 60 * 1000) {
+        this._recoverFeed(this.mse?.gen ?? 0, 'decode error', true);
+        return;
+      }
+      this._returnToOriginalAt = pos + 45;
+      this.emit('fallback', { reason: 'Your browser can\'t decode this part of the file – converting it for a moment.' });
+      this.reload({ forceMode: 'transcode', startPosition: pos, keepPlaying: true });
+    }
+  }
+
   /** Automatic mode, single converted stream: restart one quality step lower. */
   stepDown(why) {
     if (this._steppingDown || this.data.fixedQuality) return;
@@ -677,6 +728,12 @@ export class Playback extends EventTarget {
 
   _watchdog() {
     if (!this.data || this.destroyed) return;
+    if (this._returnToOriginalAt != null && this.mode === 'transcode' && !this.video.paused && this.currentTime > this._returnToOriginalAt) {
+      this._returnToOriginalAt = null;
+      this.emit('fallback', { reason: 'Past the damaged section – back to the original quality.' });
+      this.reload({ forceMode: undefined });
+      return;
+    }
     const q = this.video.getVideoPlaybackQuality?.();
     if (q) {
       this._frames = (this._frames || []).concat({ t: performance.now(), dropped: q.droppedVideoFrames, total: q.totalVideoFrames }).slice(-9);
@@ -740,9 +797,10 @@ export class Playback extends EventTarget {
 
   async report() {
     if (!this.data || this.destroyed) return;
+    const sid = this.data.sessionId;
     const q = this.video.getVideoPlaybackQuality?.();
     try {
-      const r = await api.post(`/api/playback/session/${this.data.sessionId}/progress`, {
+      const r = await api.post(`/api/playback/session/${sid}/progress`, {
         position: this.currentTime,
         paused: this.video.paused,
         buffer: Math.round(this.bufferedAhead()),
@@ -765,7 +823,8 @@ export class Playback extends EventTarget {
         this.emit('fallback', { reason: 'The server is busy – lowered quality to avoid buffering.' });
       }
     } catch (e) {
-      if (e.status === 404) this.emit('expired');
+      // 404 for a session we're replacing right now (or already replaced) is expected, not expiry.
+      if (e.status === 404 && this.data?.sessionId === sid && !this._loadInFlight && !this.destroyed) this.emit('expired');
     }
   }
 
