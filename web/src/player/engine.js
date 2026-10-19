@@ -36,8 +36,10 @@ export function cueHtml(text) {
 // ------------------------------------------------------------ playback controller
 
 // Remux via MSE: how far ahead we pull the stream, and how much played data we keep for quick back-seeks.
-const MSE_MAX_AHEAD = 150;
-const MSE_BACK_KEEP = 60;
+const MSE_MAX_AHEAD = 150; // seconds, upper bound
+// Browsers cap a SourceBuffer at roughly 150 MB of video (Chrome) – at 40 Mbps that is only ~30 s.
+// Start from a byte budget below that, then learn the real limit from QuotaExceededError.
+const MSE_BYTE_BUDGET = 110 * 1000 * 1000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** Codec string for the fragmented MP4 the server remuxes, or null if MSE can't take it. */
@@ -65,12 +67,28 @@ export function remuxMime(source) {
   return MS?.isTypeSupported?.(mime) ? mime : null;
 }
 
+/**
+ * hls.js assumes segments already exist on a CDN. Ours are encoded on demand, so the first byte
+ * of a segment can take a few seconds after a seek or a quality change. The stock controller reads
+ * that as a slow network, aborts the download and switches down – which starts a second encoder
+ * and makes everything slower. Keep the normal bandwidth-based choice, drop the emergency abort.
+ */
+const BaseAbr = Hls.DefaultConfig.abrController;
+class TranscodeAbrController extends BaseAbr {
+  constructor(hls) {
+    super(hls);
+    this._abandonRulesCheck = () => {};
+  }
+}
+
 const HLS_CONFIG = {
-  // Keep a deep forward buffer: this is what rides out Wi-Fi dips and congested links.
-  maxBufferLength: 90,
-  maxMaxBufferLength: 600,
-  maxBufferSize: 400 * 1000 * 1000,
-  backBufferLength: 60,
+  abrController: TranscodeAbrController,
+  // A deep forward buffer rides out Wi-Fi dips, but it has to fit the browser's SourceBuffer
+  // memory (~150 MB in Chrome); overshooting causes "buffer full" errors and stalls.
+  maxBufferLength: 60,
+  maxMaxBufferLength: 300,
+  maxBufferSize: 120 * 1000 * 1000,
+  backBufferLength: 30,
   maxBufferHole: 0.5,
   nudgeMaxRetry: 10,
   startFragPrefetch: true,
@@ -191,6 +209,7 @@ export class Playback extends EventTarget {
       quality: this.opts.quality,
       maxBitrate: this.opts.maxBitrate,
       forceMode: this.opts.forceMode,
+      capHeight: this.opts.capHeight,
       startPosition: this.opts.startPosition,
       client: clientName(),
       replaceSession: this.data?.sessionId,
@@ -236,7 +255,9 @@ export class Playback extends EventTarget {
     const v = this.video;
     if (window.ManagedMediaSource && MS === window.ManagedMediaSource) v.disableRemotePlayback = true;
     const objUrl = URL.createObjectURL(ms);
-    this.mse = { ms, sb: null, gen: 0, ctrl: null, objUrl, lastTrim: 0 };
+    const bps = Math.max(1e6, this.data?.source?.bitrate || 8e6);
+    const limit = Math.max(12, Math.min(MSE_MAX_AHEAD, (MSE_BYTE_BUDGET * 8) / bps));
+    this.mse = { ms, sb: null, gen: 0, ctrl: null, objUrl, lastTrim: 0, limit };
     ms.addEventListener(
       'sourceopen',
       () => {
@@ -267,11 +288,21 @@ export class Playback extends EventTarget {
     return this.bufferedAhead();
   }
 
+  /** Seconds we try to keep buffered ahead (fits the browser's memory limit for this bitrate). */
+  _mseLimit() {
+    return this.mse?.limit || 30;
+  }
+
+  /**
+   * Append one chunk. Never drops data: a lost chunk corrupts the fMP4 stream and playback
+   * would freeze where the hole is. When the browser's buffer is full we free played data
+   * and wait – as long as it takes (e.g. while paused) – for playback to make room.
+   */
   async _append(sb, chunk, gen) {
     const m = this.mse;
-    for (let attempt = 0; attempt < 4; attempt++) {
+    for (;;) {
       await this._sbIdle(sb);
-      if (!m || gen !== m.gen) return;
+      if (!m || gen !== m.gen || m.ms.readyState !== 'open') return;
       try {
         sb.appendBuffer(chunk);
         await this._sbIdle(sb);
@@ -279,13 +310,21 @@ export class Playback extends EventTarget {
         return;
       } catch (e) {
         if (e.name !== 'QuotaExceededError') throw e;
-        // Out of buffer memory: drop played data and wait for playback to catch up.
-        const cut = this.video.currentTime - 10;
-        if (cut > 0 && sb.buffered.length) {
-          sb.remove(0, cut);
-          await this._sbIdle(sb);
+        // Learn the real capacity so the reader stops before hitting it next time.
+        const ahead = this._mseAhead();
+        if (ahead > 4) m.limit = Math.max(8, Math.min(m.limit, ahead * 0.85));
+        const cut = this.video.currentTime - 3;
+        if (cut > 0 && sb.buffered.length && sb.buffered.start(0) < cut) {
+          try {
+            sb.remove(0, cut);
+            await this._sbIdle(sb);
+          } catch {
+            /* ignore */
+          }
         }
-        await sleep(1500);
+        // Wait for playback to consume some of the buffer (indefinitely while paused).
+        const target = Math.max(4, ahead - 3);
+        while (gen === m.gen && this._mseAhead() > target) await sleep(400);
       }
     }
   }
@@ -293,12 +332,45 @@ export class Playback extends EventTarget {
   async _trimBack(sb) {
     const m = this.mse;
     const now = performance.now();
-    if (!m || now - m.lastTrim < 20000 || !sb.buffered.length) return;
+    if (!m || now - m.lastTrim < 10000 || !sb.buffered.length) return;
     m.lastTrim = now;
-    const cut = this.video.currentTime - MSE_BACK_KEEP;
-    if (cut > sb.buffered.start(0) + 5) {
+    // Played data costs the same memory as data ahead; keep only a short stretch for quick rewinds.
+    const keep = Math.min(30, m.limit * 0.25);
+    const cut = this.video.currentTime - keep;
+    if (cut > sb.buffered.start(0) + 2) {
       sb.remove(0, cut);
       await this._sbIdle(sb);
+    }
+  }
+
+  /** End of the buffered range that contains the playhead. */
+  _bufferEnd() {
+    return this.video.currentTime + this.bufferedAhead();
+  }
+
+  async _recoverFeed(gen, reason, rebuild) {
+    const m = this.mse;
+    if (!m || gen !== m.gen || this.destroyed) return;
+    m.retries = (m.retries || 0) + 1;
+    if (m.retries > 6) {
+      this.emit('error', { message: `The stream keeps dropping (${reason}).` });
+      return;
+    }
+    await sleep(Math.min(5000, 400 * 2 ** (m.retries - 1)));
+    if (!this.mse || gen !== this.mse.gen || this.destroyed) return;
+    try {
+      const pos = rebuild ? this.currentTime : this._bufferEnd();
+      const r = await api.post(`/api/playback/session/${this.data.sessionId}/seek`, { position: pos });
+      if (!this.mse || gen !== this.mse.gen) return;
+      this.offset = r.offset;
+      if (rebuild) {
+        const wasPaused = this.video.paused;
+        this._attach(r.url, pos);
+        if (wasPaused) this.video.pause();
+      } else this._feed(r.url, r.offset);
+    } catch (e) {
+      if (e.status === 404) this.emit('expired');
+      else this._recoverFeed(gen, e.message, rebuild);
     }
   }
 
@@ -341,18 +413,31 @@ export class Playback extends EventTarget {
       pending = [];
       pendingBytes = 0;
       lastFlush = performance.now();
-      await this._append(sb, buf, gen);
+      try {
+        await this._append(sb, buf, gen);
+      } catch (e) {
+        e.fromAppend = true;
+        throw e;
+      }
+      m.retries = 0;
     };
     try {
       for (;;) {
         // Backpressure: stop reading once we're far enough ahead; TCP then pauses the server's ffmpeg.
-        while (gen === m.gen && this._mseAhead() > MSE_MAX_AHEAD) await sleep(500);
+        while (gen === m.gen && this._mseAhead() > this._mseLimit()) await sleep(400);
         if (gen !== m.gen) break;
         const { done, value } = await reader.read();
         if (gen !== m.gen) break;
         if (done) {
           await flush();
           await this._sbIdle(sb);
+          // The server stream ended before the file did (ffmpeg crashed, proxy timeout…): continue
+          // from where the buffer ends instead of treating it as the end of the movie.
+          const end = this._bufferEnd();
+          if (gen === m.gen && end < this.duration - 2) {
+            this._recoverFeed(gen, 'stream ended early', false);
+            return;
+          }
           if (gen === m.gen && m.ms.readyState === 'open') {
             try {
               m.ms.endOfStream();
@@ -368,7 +453,11 @@ export class Playback extends EventTarget {
         if (pendingBytes >= 1024 * 1024 || performance.now() - lastFlush > 250 || this._mseAhead() < 3) await flush();
       }
     } catch (e) {
-      if (e.name !== 'AbortError') console.warn('[remux] feed error', e);
+      if (e.name !== 'AbortError' && gen === m.gen) {
+        console.warn('[remux] feed error', e);
+        // Network hiccup: resume downloading after the buffered part. Broken buffer: rebuild it.
+        this._recoverFeed(gen, e.message, !!e.fromAppend);
+      }
     }
     try {
       reader.cancel();
@@ -495,7 +584,20 @@ export class Playback extends EventTarget {
     }
     // Fixed qualities and "original" are decided by the server (it may play the file itself
     // when the original is already within the chosen quality).
-    return this.reload({ quality: q, forceMode: undefined });
+    return this.reload({ quality: q, forceMode: undefined, capHeight: undefined });
+  }
+
+  /** Automatic mode, single converted stream: restart one quality step lower. */
+  stepDown(why) {
+    if (this._steppingDown || this.data.fixedQuality) return;
+    const cur = this.data.renditions[0];
+    const lower = this.data.qualities.find((q) => q.height < cur.height);
+    if (!lower) return;
+    this._steppingDown = true;
+    this.recentStalls = [];
+    this.stallStart = null;
+    this.emit('fallback', { reason: `${why} – switched to ${lower.id}.` });
+    this.reload({ capHeight: lower.height }).finally(() => (this._steppingDown = false));
   }
 
   _onStall(ms) {
@@ -518,6 +620,10 @@ export class Playback extends EventTarget {
       return;
     }
 
+    if (this.mode === 'transcode' && this.data.renditions.length === 1) {
+      this.stepDown('Playback kept pausing to load');
+      return;
+    }
     if (this.mode !== 'transcode' && this.opts.quality !== 'original' && !this._fellBack) {
       // The original file is too heavy for this connection: switch to adaptive streaming.
       this._fellBack = true;
@@ -557,6 +663,10 @@ export class Playback extends EventTarget {
       this.emit('server', r.session);
       // The server can't encode this rendition in real time and our buffer is draining: step down.
       const t = r.session?.transcode;
+      // Single rendition and the encoder runs slower than real time with the buffer draining.
+      if (!this.data.fixedQuality && this.data.renditions.length === 1 && t?.running && !t.throttled && t.speed && t.speed < 0.95 && this.bufferedAhead() < 15) {
+        this.stepDown('The server can\'t convert this quality in real time');
+      }
       if (this.hls && !this.data.fixedQuality && t?.running && t.speed && t.speed < 1.05 && this.bufferedAhead() < 20 && this.hls.currentLevel > 0 && !this.capped) {
         this.capped = true;
         this.hls.autoLevelCapping = this.hls.currentLevel - 1;

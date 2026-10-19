@@ -336,6 +336,12 @@ setInterval(() => {
         killJob(rs);
         continue;
       }
+      // The player switched to another quality: freeze this encoder right away so the two
+      // don't split the CPU (it resumes instantly if the player switches back).
+      if (otherActive) {
+        pause(job);
+        continue;
+      }
       const ahead = job.produced - rs.lastRequested;
       if (!job.paused && ahead > aheadSegments()) pause(job);
       else maybeResume(rs);

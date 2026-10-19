@@ -96,6 +96,7 @@ export default async function playbackRoutes(app) {
       maxBitrate: Number(body.maxBitrate ?? prefs.maxBitrate ?? 0),
       bandwidth: Number(body.bandwidth || 0),
       forceMode: body.forceMode,
+      capHeight: Number(body.capHeight) || null,
       settings,
     });
 

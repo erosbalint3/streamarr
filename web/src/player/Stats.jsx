@@ -22,7 +22,9 @@ export default function Stats({ data, pb, server, level, onClose }) {
   const [title, desc] =
     data.mode === 'transcode' && data.fixedQuality
       ? ['Converted', `Converted to the fixed ${data.renditions[0].id} quality you picked. Quality won't change on its own.`]
-      : MODE[data.mode];
+      : data.mode === 'transcode' && data.renditions.length === 1
+        ? ['Converted', `Converted at ${data.renditions[0].id}, the best quality for your connection. Steps down automatically only if the server can't keep up.`]
+        : MODE[data.mode];
 
   const rows = [
     ['Source', `${data.source.container?.toUpperCase()} · ${v.codec} ${v.width}×${v.height}${v.hdr ? ` ${v.hdr.toUpperCase()}` : ''} · ${formatBitrate(data.source.bitrate)}`],

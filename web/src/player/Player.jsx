@@ -10,7 +10,7 @@ import {
 } from '../components/Icons.jsx';
 
 const MODE_LABEL = { direct: 'Direct play', remux: 'Direct stream', transcode: 'Adaptive' };
-const modeLabel = (d) => (d.mode === 'transcode' && d.fixedQuality ? 'Converted' : MODE_LABEL[d.mode]);
+const modeLabel = (d) => (d.mode === 'transcode' && d.renditions.length === 1 ? 'Converted' : MODE_LABEL[d.mode]);
 const SPEEDS = [0.75, 1, 1.25, 1.5, 2];
 
 function Menu({ title, children, onClose }) {
@@ -438,7 +438,7 @@ export default function Player() {
         {data && (
           <button className={`mode-pill mode-${data.mode}`} onClick={() => setStats((s) => !s)} title="Playback info (i)">
             {modeLabel(data)}
-            {data.mode === 'transcode' ? (data.fixedQuality ? ` · ${data.renditions[0].id}` : currentLevel ? ` · ${currentLevel.height}p` : '') : ''}
+            {data.mode === 'transcode' ? (data.renditions.length === 1 ? ` · ${data.renditions[0].id}` : currentLevel ? ` · ${currentLevel.height}p` : '') : ''}
           </button>
         )}
       </div>

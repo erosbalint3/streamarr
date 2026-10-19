@@ -94,7 +94,8 @@ export function decide(media, opts) {
 
   // Bandwidth budget. "original" quality means: never reduce quality, even if it may buffer.
   // Every quality this server can offer for this file (also feeds the player's quality menu).
-  const fullLadder = buildLadder(media, { hwaccel: settings.hwaccel, maxSoftwareHeight: settings.maxSoftwareHeight, maxHeight: caps.maxHeight });
+  const maxHeight = Math.min(caps.maxHeight || 2160, opts.capHeight || 2160);
+  const fullLadder = buildLadder(media, { hwaccel: settings.hwaccel, maxSoftwareHeight: settings.maxSoftwareHeight, maxHeight });
 
   // A fixed quality ("720p") picked by the user: one rendition, no adaptive switching.
   const explicitQuality = !!opts.quality && !['auto', 'original'].includes(opts.quality);
@@ -110,7 +111,7 @@ export function decide(media, opts) {
   const budget = Math.min(userCap, netCap);
   // Files have peaks well above their average bitrate; leave headroom.
   const fits = (media.bitrate || 0) * 1.2 <= budget;
-  if (!fits) reasons.push(`file bitrate ${(media.bitrate / 1e6).toFixed(1)} Mbps exceeds the ${(budget / 1e6).toFixed(1)} Mbps budget`);
+  if (!fits) reasons.push(`file peaks (~${((media.bitrate * 1.2) / 1e6).toFixed(1)} Mbps) are too high for the ${(budget / 1e6).toFixed(1)} Mbps available`);
 
   let mode;
   if (opts.forceMode === 'transcode' || burn || !vOk || !fits || needsDownscale) mode = 'transcode';
@@ -133,9 +134,16 @@ export function decide(media, opts) {
   // Which renditions to offer when converting: the fixed one, the best one for "original"
   // (when the file itself can't be played), or the whole adaptive ladder.
   let ladder = null;
-  if (mode === 'transcode') {
-    const lock = fixedRung || (opts.quality === 'original' ? fullLadder[0] : null);
-    ladder = lock ? [lock] : fullLadder;
+  const lock = mode === 'transcode' ? fixedRung || (opts.quality === 'original' ? fullLadder[0] : null) : null;
+  if (lock) ladder = [lock];
+  else if (mode === 'transcode') {
+    // Only the renditions this connection can actually carry.
+    const fit = fullLadder.filter((r) => r.bitrate * 1.3 <= budget);
+    const usable = fit.length ? fit : [fullLadder[fullLadder.length - 1]];
+    // Lots of headroom (home network): a single rendition. Adaptive switching only helps on
+    // constrained links; with an on-the-fly encoder every switch costs a fresh encoder start.
+    ladder = usable[0].bitrate * 2.5 <= budget ? [usable[0]] : usable;
+    if (opts.capHeight) reasons.push(`limited to ${usable[0].id} so the server keeps up`);
   }
 
   const audioCopy = !!audio && audioOk && MP4_AUDIO.has(audio.codec);
@@ -148,7 +156,7 @@ export function decide(media, opts) {
     audioCopy,
     budget: Number.isFinite(budget) ? budget : null,
     ladder,
-    fixed: mode === 'transcode' && ladder.length === 1,
+    fixed: !!lock,
     qualities: fullLadder,
   };
 }
