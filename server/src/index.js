@@ -11,6 +11,7 @@ import adminRoutes from './routes/admin.js';
 import { scanAll, scheduleScans } from './scanner.js';
 import { queueBackgroundWork } from './streaming/background.js';
 import { sessions, stopSession } from './streaming/sessions.js';
+import { killBackgroundProcs } from './tasks.js';
 
 const app = Fastify({
   logger: { level: process.env.LOG_LEVEL || 'warn' },
@@ -58,6 +59,7 @@ setTimeout(() => {
 
 async function shutdown() {
   for (const id of [...sessions.keys()]) await stopSession(id);
+  killBackgroundProcs();
   await app.close();
   process.exit(0);
 }

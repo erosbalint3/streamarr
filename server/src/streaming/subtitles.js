@@ -2,6 +2,7 @@ import fsp from 'node:fs/promises';
 import path from 'node:path';
 import { config } from '../config.js';
 import { exec } from '../util/proc.js';
+import { trackBackgroundProc } from '../tasks.js';
 
 const inflight = new Map();
 const exists = (p) => fsp.access(p).then(() => true, () => false);
@@ -39,7 +40,7 @@ export async function extractAll(media) {
   if (!pending.length) return;
   const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', media.path];
   for (const sub of pending) args.push('-map', `0:${sub.index}`, '-c:s', 'webvtt', '-f', 'webvtt', `${vttPath(media, sub)}.tmp`);
-  await exec(config.ffmpeg, args, { timeout: 30 * 60 * 1000, nice: true });
+  await exec(config.ffmpeg, args, { timeout: 24 * 60 * 60 * 1000, nice: true, onSpawn: trackBackgroundProc });
   for (const sub of pending) await fsp.rename(`${vttPath(media, sub)}.tmp`, vttPath(media, sub)).catch(() => {});
 }
 

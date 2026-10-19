@@ -5,6 +5,7 @@ import { config } from '../config.js';
 import { run } from '../db.js';
 import { exec } from '../util/proc.js';
 import { tonemapFilter } from './encoder.js';
+import { trackBackgroundProc } from '../tasks.js';
 
 export const TRICKPLAY = { interval: 10, cols: 10, rows: 10, width: 240 };
 
@@ -33,7 +34,7 @@ export async function generateTrickplay(media) {
       '-q:v', '6', '-start_number', '0',
       path.join(dir, '%d.jpg'),
     ],
-    { timeout: 60 * 60 * 1000, nice: true }
+    { timeout: 24 * 60 * 60 * 1000, nice: true, onSpawn: trackBackgroundProc }
   );
   const count = Math.ceil(media.duration / interval);
   const info = { interval, cols, rows, width, height, count, sheets: Math.ceil(count / (cols * rows)) };

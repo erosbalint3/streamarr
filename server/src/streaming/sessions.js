@@ -68,6 +68,7 @@ export function createSession({ user, item, media, decision, client, startPositi
   const h = run('INSERT INTO play_history (user_id, item_id, mode, started_at, client) VALUES (?, ?, ?, ?, ?)', user.id, item.id, decision.mode, Date.now(), session.client);
   session.historyId = Number(h.lastInsertRowid);
   sessions.set(id, session);
+  updateBackgroundPause();
   return session;
 }
 
@@ -292,14 +293,16 @@ function maybeResume(rs) {
   if (job?.paused && job.produced - rs.lastRequested < aheadSegments() * 0.75) resume(job);
 }
 
-function activeJobs() {
-  let n = 0;
-  for (const s of sessions.values()) for (const rs of s.renditions.values()) if (rs.job && !rs.job.exited && !rs.job.paused) n++;
-  return n;
-}
-
+/**
+ * Any open player – direct play and direct stream read the same disks as background jobs.
+ * Players report every 10 s (also while paused), so a session silent for 45 s is a closed
+ * tab or a sleeping phone and no longer holds background work back.
+ */
 function updateBackgroundPause() {
-  setBackgroundPaused(activeJobs() > 0);
+  const now = Date.now();
+  let watching = false;
+  for (const s of sessions.values()) if (now - s.lastSeen < 45000) watching = true;
+  setBackgroundPaused(watching);
 }
 
 /** Delete segments well behind the playhead (and stale ones far ahead of it) to bound scratch space. */

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import crypto from 'node:crypto';
 import { get, run, json, getSettings } from '../db.js';
 import { requireUser } from '../auth.js';
@@ -167,7 +168,15 @@ export default async function playbackRoutes(app) {
     s.position = position;
     s.paused = !!b.paused;
     s.stats = { buffer: b.buffer, bandwidth: b.bandwidth, level: b.level, dropped: b.droppedFrames };
-    if (b.stalls != null) s.stalls = Number(b.stalls);
+    if (b.stalls != null && Number(b.stalls) > s.stalls) {
+      // Logged so `docker logs streamarr` shows what was going on when playback stopped.
+      const t = sessionSummary(s).transcode;
+      console.warn(
+        `[playback] stall #${b.stalls} – ${s.username} · "${s.title}" · ${s.mode} at ${Math.round(position)}s · client buffer ${b.buffer ?? '?'}s · ` +
+          `connection ${b.bandwidth ? (b.bandwidth / 1e6).toFixed(0) + ' Mbps' : '?'}${t ? ` · encoder ${t.speed ?? '?'}x (${t.level})` : ''} · load ${os.loadavg()[0].toFixed(1)}`
+      );
+      s.stalls = Number(b.stalls);
+    }
 
     const duration = s.media.duration;
     const watched = duration > 0 && position / duration >= 0.92;

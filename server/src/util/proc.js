@@ -1,10 +1,17 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+
+// ionice (util-linux) puts background jobs in the "idle" disk class: they only get disk time
+// nobody else wants, so they can never starve a stream reading from the same drive.
+const IONICE = ['/usr/bin/ionice', '/bin/ionice'].find((p) => fs.existsSync(p));
 
 /** Run a command and collect stdout. Rejects on non-zero exit or timeout. */
-export function exec(cmd, args, { timeout = 120000, maxBuffer = 64 * 1024 * 1024, nice = false } = {}) {
+export function exec(cmd, args, { timeout = 120000, maxBuffer = 64 * 1024 * 1024, nice = false, onSpawn = null } = {}) {
   return new Promise((resolve, reject) => {
-    const [bin, argv] = nice ? ['nice', ['-n', '15', cmd, ...args]] : [cmd, args];
+    let [bin, argv] = [cmd, args];
+    if (nice) [bin, argv] = IONICE ? [IONICE, ['-c', '3', 'nice', '-n', '15', cmd, ...args]] : ['nice', ['-n', '15', cmd, ...args]];
     const child = spawn(bin, argv, { stdio: ['ignore', 'pipe', 'pipe'] });
+    onSpawn?.(child);
     const out = [];
     let outLen = 0;
     let err = '';
