@@ -3,7 +3,7 @@ import path from 'node:path';
 import { all, get, run, tx, json, getSettings } from './db.js';
 import { probe } from './util/ffprobe.js';
 import { limiter } from './util/proc.js';
-import { VIDEO_EXTS, parseMovieName, parseEpisode, sortTitle, isSample } from './util/naming.js';
+import { VIDEO_EXTS, parseMovieName, parseEpisode, parseMixed, sortTitle, isSample } from './util/naming.js';
 import { localArtForMovie, localArtForShow, localArtForSeason, localThumbForEpisode } from './images.js';
 import { enrichPending, tmdbEnabled } from './metadata/tmdb.js';
 import { queueBackgroundWork, queueArtwork } from './streaming/background.js';
@@ -120,11 +120,21 @@ async function addVideo(lib, file, info) {
   return id;
 }
 
-async function addEpisode(lib, file, info) {
-  const ep = parseEpisode(file.path, file.root);
-  let show = get("SELECT * FROM items WHERE library_id = ? AND type = 'show' AND path_key = ?", lib.id, ep.showKey);
+/** The show an episode belongs to: by its key, or by another spelling merged into it earlier. */
+function findShow(libId, key) {
+  return (
+    get("SELECT * FROM items WHERE library_id = ? AND type = 'show' AND path_key = ?", libId, key) ||
+    get("SELECT i.* FROM show_aliases a JOIN items i ON i.id = a.show_id WHERE a.library_id = ? AND a.alias = ?", libId, key)
+  );
+}
+
+async function addEpisode(lib, file, info, ep) {
+  // TV libraries: the show key is the show's folder. Mixed folders: a normalised title (showDir is
+  // the show's folder when there is one).
+  const showDir = lib.type === 'mixed' ? ep.showDir : ep.showKey;
+  let show = findShow(lib.id, ep.showKey);
   if (!show) {
-    const art = await localArtForShow(ep.showKey);
+    const art = showDir ? await localArtForShow(showDir) : {};
     const id = insertItem({
       library_id: lib.id,
       type: 'show',
@@ -140,7 +150,7 @@ async function addEpisode(lib, file, info) {
     show = get('SELECT * FROM items WHERE id = ?', id);
   }
   const seasonKey = `${ep.showKey}#S${ep.season}`;
-  let season = get("SELECT * FROM items WHERE library_id = ? AND type = 'season' AND path_key = ?", lib.id, seasonKey);
+  let season = get("SELECT * FROM items WHERE type = 'season' AND parent_id = ? AND season_number = ?", show.id, ep.season);
   if (!season) {
     const seasonDir = path.dirname(file.path);
     const id = insertItem({
@@ -152,7 +162,7 @@ async function addEpisode(lib, file, info) {
       title: ep.season === 0 ? 'Specials' : `Season ${ep.season}`,
       sort_title: String(ep.season).padStart(4, '0'),
       season_number: ep.season,
-      poster: await localArtForSeason(ep.showKey, seasonDir, ep.season),
+      poster: showDir ? await localArtForSeason(showDir, seasonDir, ep.season) : null,
     });
     season = { id };
   }
@@ -176,6 +186,75 @@ async function addEpisode(lib, file, info) {
   return id;
 }
 
+/** What a file should be in this library: { kind: 'movie' | 'episode' | 'video', ep? }. */
+function classify(lib, file) {
+  if (lib.type === 'movies') return { kind: 'movie' };
+  if (lib.type === 'other') return { kind: 'video' };
+  const ep = lib.type === 'shows' ? parseEpisode(file.path, file.root) : parseMixed(file.path, file.root);
+  return ep ? { kind: 'episode', ep } : { kind: 'movie' };
+}
+
+/** Does the existing item already match the classification? (Otherwise it is rebuilt.) */
+function sameIdentity(lib, e, want) {
+  if (e.item_type !== want.kind) return false;
+  if (want.kind !== 'episode') return true;
+  const show = findShow(lib.id, want.ep.showKey);
+  return !!show && show.id === e.show_id && e.season_number === want.ep.season && e.episode_number === want.ep.episode;
+}
+
+// Watch progress, My List and history follow a file when its item is rebuilt (e.g. a movie that is
+// really an episode, after switching the library to "Movies & TV").
+function snapshotUserData(itemId) {
+  return {
+    progress: all('SELECT * FROM progress WHERE item_id = ?', itemId),
+    favorites: all('SELECT * FROM favorites WHERE item_id = ?', itemId),
+  };
+}
+
+function restoreUserData(oldId, newId, snap) {
+  for (const table of ['progress', 'favorites']) {
+    for (const row of snap[table]) {
+      const r = { ...row, item_id: newId };
+      const keys = Object.keys(r);
+      run(`INSERT OR REPLACE INTO ${table} (${keys.join(', ')}) VALUES (${keys.map(() => '?').join(', ')})`, ...keys.map((k) => r[k]));
+    }
+  }
+  run('UPDATE play_history SET item_id = ? WHERE item_id = ?', newId, oldId);
+}
+
+/**
+ * Two spellings of one show ("Marvels.Daredevil" and "Daredevil") end up as separate shows until
+ * TMDB identifies them: then fold them into one, keeping the other spelling as an alias.
+ */
+export function mergeDuplicateShows() {
+  const groups = all(
+    `SELECT library_id, tmdb_id, MIN(id) AS keep FROM items WHERE type = 'show' AND tmdb_id IS NOT NULL
+     GROUP BY library_id, tmdb_id HAVING COUNT(*) > 1`
+  );
+  for (const g of groups) {
+    const others = all("SELECT * FROM items WHERE type = 'show' AND library_id = ? AND tmdb_id = ? AND id != ?", g.library_id, g.tmdb_id, g.keep);
+    tx(() => {
+      for (const o of others) {
+        for (const season of all("SELECT * FROM items WHERE parent_id = ? AND type = 'season'", o.id)) {
+          const target = get("SELECT id FROM items WHERE parent_id = ? AND type = 'season' AND season_number = ?", g.keep, season.season_number);
+          if (target) {
+            run('UPDATE items SET parent_id = ?, show_id = ? WHERE parent_id = ?', target.id, g.keep, season.id);
+            run('DELETE FROM items WHERE id = ?', season.id);
+          } else {
+            run('UPDATE items SET parent_id = ?, show_id = ? WHERE id = ?', g.keep, g.keep, season.id);
+            run('UPDATE items SET show_id = ? WHERE parent_id = ?', g.keep, season.id);
+          }
+        }
+        run('INSERT OR IGNORE INTO favorites (user_id, item_id, added_at) SELECT user_id, ?, added_at FROM favorites WHERE item_id = ?', g.keep, o.id);
+        run('UPDATE show_aliases SET show_id = ? WHERE show_id = ?', g.keep, o.id);
+        run('INSERT OR REPLACE INTO show_aliases (library_id, alias, show_id) VALUES (?, ?, ?)', g.library_id, o.path_key, g.keep);
+        run('DELETE FROM items WHERE id = ?', o.id);
+      }
+    });
+    log(`Merged ${others.length + 1} copies of show #${g.keep} (TMDB ${g.tmdb_id})`);
+  }
+}
+
 function cleanupEmpty(libId) {
   run(`DELETE FROM items WHERE library_id = ? AND type = 'season' AND NOT EXISTS (SELECT 1 FROM items e WHERE e.parent_id = items.id)`, libId);
   run(`DELETE FROM items WHERE library_id = ? AND type = 'show' AND NOT EXISTS (SELECT 1 FROM items s WHERE s.parent_id = items.id)`, libId);
@@ -189,8 +268,13 @@ export async function scanLibrary(lib, { full = false } = {}) {
   for (const root of roots) files = files.concat(await walk(root));
 
   const existing = new Map(
-    all('SELECT mf.path, mf.size, mf.mtime, mf.item_id FROM media_files mf JOIN items i ON i.id = mf.item_id WHERE i.library_id = ?', lib.id).map((r) => [r.path, r])
+    all(
+      `SELECT mf.path, mf.size, mf.mtime, mf.item_id, i.type AS item_type, i.show_id, i.season_number, i.episode_number
+       FROM media_files mf JOIN items i ON i.id = mf.item_id WHERE i.library_id = ?`,
+      lib.id
+    ).map((r) => [r.path, r])
   );
+  for (const f of files) f.want = classify(lib, f);
   const seen = new Set(files.map((f) => f.path));
 
   // Removed files
@@ -203,8 +287,11 @@ export async function scanLibrary(lib, { full = false } = {}) {
 
   const todo = files.filter((f) => {
     const e = existing.get(f.path);
-    return full || !e || e.size !== f.size || e.mtime !== f.mtime;
+    if (e && !sameIdentity(lib, e, f.want)) f.rebuild = true;
+    return full || !e || f.rebuild || e.size !== f.size || e.mtime !== f.mtime;
   });
+  const rebuilt = todo.filter((f) => f.rebuild).length;
+  if (rebuilt) log(`${lib.name}: re-sorting ${rebuilt} files (movie ↔ episode or show grouping changed)`);
   scanState.phase = 'Reading media info';
   scanState.total += todo.length;
 
@@ -217,17 +304,21 @@ export async function scanLibrary(lib, { full = false } = {}) {
           const info = await probe(file.path);
           if (!info.video) throw new Error('no video stream');
           const e = existing.get(file.path);
-          if (e) {
+          if (e && !file.rebuild) {
             upsertMedia(e.item_id, file, info);
             newIds.push(e.item_id);
           } else {
-            const taken = get('SELECT item_id FROM media_files WHERE path = ?', file.path);
-            if (taken) return;
-            const id = await serial(() =>
-              lib.type === 'movies' ? addMovie(lib, file, info, roots) : lib.type === 'shows' ? addEpisode(lib, file, info) : addVideo(lib, file, info)
-            );
+            if (!e && get('SELECT item_id FROM media_files WHERE path = ?', file.path)) return; // in another library
+            const { kind, ep } = file.want;
+            const id = await serial(async () => {
+              const snap = e ? snapshotUserData(e.item_id) : null;
+              if (e) run('DELETE FROM items WHERE id = ?', e.item_id);
+              const newId = kind === 'movie' ? await addMovie(lib, file, info, roots) : kind === 'episode' ? await addEpisode(lib, file, info, ep) : await addVideo(lib, file, info);
+              if (snap) restoreUserData(e.item_id, newId, snap);
+              return newId;
+            });
             newIds.push(id);
-            scanState.added++;
+            if (!e) scanState.added++;
           }
         } catch (err) {
           scanState.errors.push(`${path.basename(file.path)}: ${err.message}`);
@@ -268,6 +359,7 @@ export async function scanAll({ libraryId = null, full = false } = {}) {
     for (const lib of libs) ids = ids.concat(await scanLibrary(lib, { full }));
     scanState.phase = 'Fetching metadata';
     await enrichPending(log).catch((e) => scanState.errors.push(`Metadata: ${e.message}`));
+    mergeDuplicateShows();
     queueArtwork();
     queueBackgroundWork(ids);
   } catch (e) {

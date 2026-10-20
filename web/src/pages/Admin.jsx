@@ -161,8 +161,16 @@ function FolderPicker({ onPick, onClose }) {
   );
 }
 
+const TYPE_LABEL = { movies: 'Movies', shows: 'TV shows', mixed: 'Movies & TV', other: 'Other videos' };
+const TYPE_HINT = {
+  movies: 'Files like The Matrix (1999).mkv, optionally in their own folder.',
+  shows: 'One folder per show, e.g. Breaking Bad/Season 01/Breaking.Bad.S01E01.mkv',
+  mixed: 'One folder with everything, e.g. your torrent downloads. Episodes (S01E02, 1x02, season packs, anime “- 05”) are grouped into shows; everything else is a movie.',
+  other: 'Home videos, clips – no metadata lookup.',
+};
+
 function Libraries() {
-  const [libs, reload] = usePoll('/api/libraries', 0);
+  const [libs, reload] = usePoll('/api/libraries?admin=1', 0);
   const [scan, reloadScan] = usePoll('/api/scan', 2000);
   const [form, setForm] = useState(null);
   const [picker, setPicker] = useState(false);
@@ -174,10 +182,21 @@ function Libraries() {
   const save = async (e) => {
     e.preventDefault();
     try {
-      if (form.id) await api.put(`/api/libraries/${form.id}`, { name: form.name, paths: form.paths });
+      if (form.id) await api.put(`/api/libraries/${form.id}`, { name: form.name, paths: form.paths, type: form.type });
       else await api.post('/api/libraries', form);
       toast(form.id ? 'Library updated – rescanning' : 'Library added – scanning now', 'ok');
       setForm(null);
+      reload();
+      reloadScan();
+    } catch (err) {
+      toast(err.message, 'bad');
+    }
+  };
+
+  const switchToMixed = async (lib) => {
+    try {
+      await api.put(`/api/libraries/${lib.id}`, { type: 'mixed' });
+      toast('Sorting movies and episodes – rescanning', 'ok');
       reload();
       reloadScan();
     } catch (err) {
@@ -211,14 +230,20 @@ function Libraries() {
             <div>
               <h3>{l.name}</h3>
               <p className="muted small">
-                {l.type === 'movies' ? 'Movies' : l.type === 'shows' ? 'TV shows' : 'Other videos'} · {plural(l.itemCount, 'title')}{l.episodeCount ? ` · ${plural(l.episodeCount, 'episode')}` : ''} · scanned {timeAgo(l.lastScan)}
+                {TYPE_LABEL[l.type]} · {l.type === 'mixed' ? `${plural(l.movieCount, 'movie')} · ${plural(l.showCount, 'show')}` : plural(l.itemCount, 'title')}{l.episodeCount ? ` · ${plural(l.episodeCount, 'episode')}` : ''} · scanned {timeAgo(l.lastScan)}
               </p>
+              {l.episodeLike > 0 && (
+                <div className="lib-hint">
+                  <span>{plural(l.episodeLike, 'file')} here {l.episodeLike === 1 ? 'is' : 'are'} named like TV episodes. Switch to <strong>Movies &amp; TV</strong> to group {l.episodeLike === 1 ? 'it' : 'them'} into shows with next-episode playback — watch progress is kept.</span>
+                  <button className="btn btn-primary btn-sm" onClick={() => switchToMixed(l)}>Switch to Movies &amp; TV</button>
+                </div>
+              )}
               {l.paths.map((p) => <code key={p} className="path">{p}</code>)}
             </div>
             <div className="lib-actions">
               <button className="btn btn-glass btn-sm" onClick={() => rescan(l)}><IconRefresh size={16} /> Scan</button>
               <button className="btn btn-glass btn-sm" onClick={() => rescan(l, true)}>Full rescan</button>
-              <button className="btn btn-glass btn-sm" onClick={() => setForm({ id: l.id, name: l.name, type: l.type, paths: l.paths })}>Edit</button>
+              <button className="btn btn-glass btn-sm" onClick={() => setForm({ id: l.id, name: l.name, type: l.type, originalType: l.type, paths: l.paths })}>Edit</button>
               <button className="icon-btn" onClick={() => remove(l)} aria-label={`Remove ${l.name}`}><IconTrash size={18} /></button>
             </div>
           </article>
@@ -239,16 +264,15 @@ function Libraries() {
             <span>Name</span>
             <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Movies" required />
           </label>
-          {!form.id && (
-            <div className="field">
-              <span>Type</span>
-              <div className="segmented">
-                {[['movies', 'Movies'], ['shows', 'TV shows'], ['other', 'Other videos']].map(([k, l]) => (
-                  <button type="button" key={k} className={form.type === k ? 'on' : ''} onClick={() => setForm({ ...form, type: k })}>{l}</button>
-                ))}
-              </div>
+          <div className="field">
+            <span>Type</span>
+            <div className="segmented segmented-wrap">
+              {Object.entries(TYPE_LABEL).map(([k, l]) => (
+                <button type="button" key={k} className={form.type === k ? 'on' : ''} onClick={() => setForm({ ...form, type: k })}>{l}</button>
+              ))}
             </div>
-          )}
+            {form.id && form.type !== form.originalType && <small className="muted">Changing the type re-sorts the files. Watch progress and My List are kept.</small>}
+          </div>
           <div className="field">
             <span>Folders</span>
             {form.paths.map((p) => (
@@ -259,7 +283,7 @@ function Libraries() {
             ))}
             <button type="button" className="btn btn-glass btn-sm" onClick={() => setPicker(true)}><IconFolder size={16} /> Add folder</button>
             <small className="muted">
-              {form.type === 'shows' ? 'One folder per show, e.g. Breaking Bad/Season 01/Breaking.Bad.S01E01.mkv' : 'Files like The Matrix (1999).mkv, optionally in their own folder.'}
+              {TYPE_HINT[form.type]}
             </small>
           </div>
           <div className="row-gap">

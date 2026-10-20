@@ -43,10 +43,10 @@ The **Playback info** panel in the player (press `i`) shows the mode, why it was
 
 ## Features
 
-- **Libraries** for movies, TV shows (show → season → episode) and other videos; scene-style filenames are parsed (`The.Matrix.1999.1080p.BluRay.x264.mkv`, `Show.S01E02.mkv`, `1x02`, `Season 1/Episode 3`). Incremental rescans, periodic rescans, folder picker.
+- **Libraries** for movies, TV shows (show → season → episode), other videos, and **Movies & TV** – one mixed folder such as your torrent downloads: every file is sorted on its own (loose `Show.S01E02…mkv`, a folder per episode with any file name, season packs, `Season 2/05 - Title.mkv`, anime `[Group] Show - 05`), releases of one show are grouped however they're spelled, and duplicates merge once TMDB identifies them. Scene-style filenames are parsed (`The.Matrix.1999.1080p.BluRay.x264.mkv`, `1x02`, `Season 1/Episode 3`). Switching a library's type keeps watch progress. Incremental rescans, periodic rescans, folder picker.
 - **Metadata from TMDB** (optional, free key): posters, backdrops, title logos, cast, ratings, genres, episode stills. Local artwork (`poster.jpg`, `fanart.jpg`, `Movie-poster.jpg`, `season01-poster.jpg`, `Episode-thumb.jpg`) always wins. Fix wrong matches by TMDB id. Without TMDB, titles get generated typographic posters and frame-grab backdrops.
 - **Home**: rotating hero, Continue watching, Up next (next unwatched episode), My list, recently added per library, highly rated, genre rows.
-- **Player**: custom controls, seek-bar **preview thumbnails**, chapter markers, subtitle rendering with size options, audio/subtitle switching mid-stream, quality menu (Auto / Original / fixed rungs), playback speed, picture-in-picture, fullscreen, keyboard shortcuts, media keys & lock-screen controls, screen wake lock, **auto-play next episode** (credits-chapter aware).
+- **Player**: custom controls, seek-bar **preview thumbnails**, chapter markers, subtitle rendering with size options, audio/subtitle switching mid-stream, quality menu (Auto / Original / fixed rungs), playback speed, picture-in-picture, fullscreen, keyboard shortcuts, media keys & lock-screen controls, screen wake lock, **Netflix-style next episode**: a *Next episode* panel with the next episode's thumbnail during the credits (counts down and continues by itself when the file has a credits chapter), and an end screen with a countdown when an episode finishes; can be turned off under Settings → Series.
 - **Subtitles**: embedded text tracks and sidecar `.srt/.vtt/.ass` (`Movie.en.srt`, `Movie.hu.forced.srt`) converted to WebVTT and pre-extracted in the background; picture-based subtitles (PGS/VobSub) are burned in on demand. Per-user default languages and "forced only" mode.
 - **HDR → SDR tone mapping** (Hable) for HDR10/HLG/Dolby Vision on SDR screens; HDR screens get the original.
 - **Hardware transcoding**: Intel Quick Sync / AMD via VAAPI, NVIDIA via NVENC, with automatic fallback.
@@ -64,7 +64,7 @@ nano .env            # set MEDIA_DIR, PUID/PGID (run `id`), optionally TMDB_API_
 docker compose up -d --build
 ```
 
-Open `http://<server-ip>:8420`, create the admin account, then **Server dashboard → Libraries → Add library** and pick folders under `/media`.
+Open `http://<server-ip>:8420`, create the admin account, then **Server dashboard → Libraries → Add library** and pick folders under `/media`. Everything in one download folder? Choose **Movies & TV**.
 
 ### Folder layout
 

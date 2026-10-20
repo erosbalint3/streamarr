@@ -28,7 +28,7 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS libraries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
-  type TEXT NOT NULL CHECK (type IN ('movies','shows','other')),
+  type TEXT NOT NULL CHECK (type IN ('movies','shows','mixed','other')),
   paths TEXT NOT NULL DEFAULT '[]',
   created_at INTEGER NOT NULL,
   last_scan INTEGER
@@ -68,6 +68,14 @@ CREATE INDEX IF NOT EXISTS idx_items_parent ON items(parent_id);
 CREATE INDEX IF NOT EXISTS idx_items_show ON items(show_id);
 CREATE INDEX IF NOT EXISTS idx_items_added ON items(added_at);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_items_pathkey ON items(library_id, type, path_key) WHERE path_key IS NOT NULL;
+
+-- Other spellings of a show that were merged into it (same TMDB id), so new episodes land there too.
+CREATE TABLE IF NOT EXISTS show_aliases (
+  library_id INTEGER NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
+  alias TEXT NOT NULL,
+  show_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+  PRIMARY KEY (library_id, alias)
+);
 
 CREATE TABLE IF NOT EXISTS media_files (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -115,6 +123,32 @@ CREATE TABLE IF NOT EXISTS play_history (
   client TEXT
 );
 `);
+
+// Migration: the 'mixed' library type (movies and shows in one folder). SQLite can't alter a CHECK
+// constraint, so the table is rebuilt – with foreign keys off, or dropping it would cascade to items.
+if (!db.prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'libraries'").get()?.sql.includes("'mixed'")) {
+  db.exec('PRAGMA foreign_keys = OFF');
+  try {
+    db.exec(`BEGIN;
+      CREATE TABLE libraries_new (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL CHECK (type IN ('movies','shows','mixed','other')),
+        paths TEXT NOT NULL DEFAULT '[]',
+        created_at INTEGER NOT NULL,
+        last_scan INTEGER
+      );
+      INSERT INTO libraries_new (id, name, type, paths, created_at, last_scan) SELECT id, name, type, paths, created_at, last_scan FROM libraries;
+      DROP TABLE libraries;
+      ALTER TABLE libraries_new RENAME TO libraries;
+      COMMIT;`);
+  } catch (e) {
+    db.exec('ROLLBACK');
+    throw e;
+  } finally {
+    db.exec('PRAGMA foreign_keys = ON');
+  }
+}
 
 const stmtCache = new Map();
 function stmt(sql) {

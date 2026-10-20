@@ -10,17 +10,53 @@ import { scanAll, scanState } from '../scanner.js';
 import { refreshItem } from '../metadata/tmdb.js';
 import { mediaForItem, audioLabel, subtitleLabel } from '../streaming/media.js';
 import { getVtt, shiftVtt } from '../streaming/subtitles.js';
+import { parseMixed } from '../util/naming.js';
 import { trickplayDir } from '../streaming/trickplay.js';
 
-const libraryOut = (l) => {
+const libraryOut = (l, { admin = false } = {}) => {
   const counts = get(
     `SELECT SUM(CASE WHEN type IN ('movie','show','video') THEN 1 ELSE 0 END) AS items,
+            SUM(CASE WHEN type = 'movie' THEN 1 ELSE 0 END) AS movies,
+            SUM(CASE WHEN type = 'show' THEN 1 ELSE 0 END) AS shows,
             SUM(CASE WHEN type = 'episode' THEN 1 ELSE 0 END) AS episodes
      FROM items WHERE library_id = ?`,
     l.id
   );
-  return { id: l.id, name: l.name, type: l.type, paths: json(l.paths, []), lastScan: l.last_scan, itemCount: counts.items || 0, episodeCount: counts.episodes || 0 };
+  const out = {
+    id: l.id,
+    name: l.name,
+    type: l.type,
+    paths: json(l.paths, []),
+    lastScan: l.last_scan,
+    itemCount: counts.items || 0,
+    movieCount: counts.movies || 0,
+    showCount: counts.shows || 0,
+    episodeCount: counts.episodes || 0,
+  };
+  if (admin && (l.type === 'movies' || l.type === 'other')) out.episodeLike = episodeLikeCount(l);
+  return out;
 };
+
+/** Files in a movie/video library named like TV episodes – a hint to switch it to "Movies & TV". */
+function episodeLikeCount(lib) {
+  const roots = json(lib.paths, []).map((p) => path.resolve(p));
+  let n = 0;
+  for (const { path: file } of all('SELECT mf.path FROM media_files mf JOIN items i ON i.id = mf.item_id WHERE i.library_id = ?', lib.id)) {
+    const root = roots.find((r) => file.startsWith(r + path.sep));
+    if (root && parseMixed(file, root)) n++;
+  }
+  return n;
+}
+
+const LIB_TYPES = ['movies', 'shows', 'mixed', 'other'];
+/** Item types listed when browsing a library (Movies & TV: both, or one via ?kind=). */
+function browseTypes(lib, kind) {
+  if (lib.type === 'movies') return ['movie'];
+  if (lib.type === 'shows') return ['show'];
+  if (lib.type === 'mixed') return kind === 'movies' ? ['movie'] : kind === 'shows' ? ['show'] : ['movie', 'show'];
+  return ['video'];
+}
+const inList = (arr) => arr.map((t) => `'${t}'`).join(',');
 
 const SORTS = {
   title: 'i.sort_title COLLATE NOCASE ASC',
@@ -90,11 +126,11 @@ function mediaInfo(media) {
 
 export default async function libraryRoutes(app) {
   // ---------------- libraries
-  app.get('/api/libraries', { preHandler: requireUser }, async () => all('SELECT * FROM libraries ORDER BY name').map(libraryOut));
+  app.get('/api/libraries', { preHandler: requireUser }, async (req) => all('SELECT * FROM libraries ORDER BY name').map((l) => libraryOut(l, { admin: !!req.user.is_admin && req.query.admin === '1' })));
 
   app.post('/api/libraries', { preHandler: requireAdmin }, async (req, reply) => {
     const { name, type, paths } = req.body || {};
-    if (!name?.trim() || !['movies', 'shows', 'other'].includes(type) || !Array.isArray(paths) || !paths.length) {
+    if (!name?.trim() || !LIB_TYPES.includes(type) || !Array.isArray(paths) || !paths.length) {
       return reply.code(400).send({ error: 'A library needs a name, a type and at least one folder.' });
     }
     for (const p of paths) {
@@ -109,9 +145,11 @@ export default async function libraryRoutes(app) {
   app.put('/api/libraries/:id', { preHandler: requireAdmin }, async (req, reply) => {
     const lib = get('SELECT * FROM libraries WHERE id = ?', req.params.id);
     if (!lib) return reply.code(404).send({ error: 'Library not found.' });
-    const { name, paths } = req.body || {};
-    run('UPDATE libraries SET name = ?, paths = ? WHERE id = ?', name?.trim() || lib.name, JSON.stringify(paths || json(lib.paths, [])), lib.id);
-    if (paths) scanAll({ libraryId: lib.id });
+    const { name, paths, type } = req.body || {};
+    if (type && !LIB_TYPES.includes(type)) return reply.code(400).send({ error: 'Unknown library type.' });
+    run('UPDATE libraries SET name = ?, paths = ?, type = ? WHERE id = ?', name?.trim() || lib.name, JSON.stringify(paths || json(lib.paths, [])), type || lib.type, lib.id);
+    // A new type re-sorts the files (movie ↔ episode); progress and My List follow each file.
+    if (paths || (type && type !== lib.type)) scanAll({ libraryId: lib.id });
     return libraryOut(get('SELECT * FROM libraries WHERE id = ?', lib.id));
   });
 
@@ -158,12 +196,12 @@ export default async function libraryRoutes(app) {
   app.get('/api/libraries/:id/items', { preHandler: requireUser }, async (req, reply) => {
     const lib = get('SELECT * FROM libraries WHERE id = ?', req.params.id);
     if (!lib) return reply.code(404).send({ error: 'Library not found.' });
-    const type = lib.type === 'movies' ? 'movie' : lib.type === 'shows' ? 'show' : 'video';
+    const types = browseTypes(lib, req.query.kind);
     const sort = SORTS[req.query.sort] || SORTS.title;
     const limit = Math.min(Number(req.query.limit) || 60, 200);
     const offset = Number(req.query.offset) || 0;
-    const where = ['i.library_id = ?', 'i.type = ?'];
-    const params = [lib.id, type];
+    const where = ['i.library_id = ?', `i.type IN (${inList(types)})`];
+    const params = [lib.id];
     if (req.query.genre) {
       where.push('EXISTS (SELECT 1 FROM json_each(i.genres) g WHERE g.value = ?)');
       params.push(req.query.genre);
@@ -173,15 +211,16 @@ export default async function libraryRoutes(app) {
       params.push(`%${req.query.q}%`);
     }
     if (req.query.filter === 'unwatched') {
-      if (type === 'show') {
-        where.push(`EXISTS (SELECT 1 FROM items e LEFT JOIN progress p ON p.item_id = e.id AND p.user_id = ? WHERE e.show_id = i.id AND e.type = 'episode' AND COALESCE(p.watched,0) = 0)`);
-      } else where.push('NOT EXISTS (SELECT 1 FROM progress p WHERE p.item_id = i.id AND p.user_id = ? AND p.watched = 1)');
-      params.push(req.user.id);
+      where.push(`CASE WHEN i.type = 'show'
+        THEN EXISTS (SELECT 1 FROM items e LEFT JOIN progress p ON p.item_id = e.id AND p.user_id = ? WHERE e.show_id = i.id AND e.type = 'episode' AND COALESCE(p.watched,0) = 0)
+        ELSE NOT EXISTS (SELECT 1 FROM progress p WHERE p.item_id = i.id AND p.user_id = ? AND p.watched = 1) END`);
+      params.push(req.user.id, req.user.id);
     }
-    const addedExpr = type === 'show' ? `(SELECT MAX(e.added_at) FROM items e WHERE e.show_id = i.id)` : 'i.added_at';
+    // A show counts as added when its newest episode arrived.
+    const addedExpr = `CASE WHEN i.type = 'show' THEN (SELECT MAX(e.added_at) FROM items e WHERE e.show_id = i.id) ELSE i.added_at END`;
     const rows = all(`SELECT i.*, ${addedExpr} AS added FROM items i WHERE ${where.join(' AND ')} ORDER BY ${sort} LIMIT ? OFFSET ?`, ...params, limit, offset);
     const total = get(`SELECT COUNT(*) AS n FROM items i WHERE ${where.join(' AND ')}`, ...params).n;
-    const genres = all(`SELECT g.value AS name, COUNT(*) AS n FROM items i, json_each(i.genres) g WHERE i.library_id = ? AND i.type = ? GROUP BY g.value ORDER BY n DESC`, lib.id, type);
+    const genres = all(`SELECT g.value AS name, COUNT(*) AS n FROM items i, json_each(i.genres) g WHERE i.library_id = ? AND i.type IN (${inList(types)}) GROUP BY g.value ORDER BY n DESC`, lib.id);
     return { library: libraryOut(lib), items: cards(req.user.id, rows), total, genres: genres.map((g) => g.name) };
   });
 
@@ -212,16 +251,12 @@ export default async function libraryRoutes(app) {
     if (favs.length) rows.push({ id: 'mylist', title: 'My list', style: 'poster', items: cards(uid, favs) });
 
     for (const lib of all('SELECT * FROM libraries ORDER BY id')) {
-      let items;
-      if (lib.type === 'shows') {
-        items = all(
-          `SELECT s.*, MAX(e.added_at) AS last_ep FROM items s JOIN items e ON e.show_id = s.id AND e.type = 'episode'
-           WHERE s.library_id = ? AND s.type = 'show' GROUP BY s.id ORDER BY last_ep DESC LIMIT 24`,
-          lib.id
-        );
-      } else {
-        items = all(`SELECT * FROM items WHERE library_id = ? AND type IN ('movie','video') ORDER BY added_at DESC LIMIT 24`, lib.id);
-      }
+      // Shows rank by their newest episode, so a show with a new episode comes back to the front.
+      const items = all(
+        `SELECT i.*, CASE WHEN i.type = 'show' THEN (SELECT MAX(e.added_at) FROM items e WHERE e.show_id = i.id) ELSE i.added_at END AS added
+         FROM items i WHERE i.library_id = ? AND i.type IN ('movie','video','show') ORDER BY added DESC LIMIT 24`,
+        lib.id
+      );
       if (items.length) rows.push({ id: `recent-${lib.id}`, title: `Recently added to ${lib.name}`, style: lib.type === 'other' ? 'landscape' : 'poster', libraryId: lib.id, items: cards(uid, items) });
     }
 

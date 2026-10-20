@@ -117,7 +117,7 @@ export default async function playbackRoutes(app) {
     let next = null;
     if (item.type === 'episode') {
       const n = adjacentEpisode(item, 1);
-      if (n) next = card(n);
+      if (n) next = card(n, { full: true }); // with overview, for the up-next screen
     }
 
     return {

@@ -24,6 +24,9 @@ jobs:
         run: |
           npm ci --no-audit --no-fund
           for f in $(find src -name '*.js'); do node --check "$f"; done
+      - name: File-name parsing (torrent folders)
+        working-directory: server
+        run: node test/naming.mjs
       - name: Build web UI
         working-directory: web
         run: |

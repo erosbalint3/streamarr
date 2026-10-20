@@ -92,6 +92,17 @@ export default function Settings() {
       </section>
 
       <section className="panel">
+        <h2>Series</h2>
+        <label className="field inline">
+          <span>Autoplay next episode</span>
+          <select value={prefs.autoplayNext === false ? 'off' : 'on'} onChange={(e) => save({ autoplayNext: e.target.value === 'on' })}>
+            <option value="on">On – count down during the credits</option>
+            <option value="off">Off – just show the button</option>
+          </select>
+        </label>
+      </section>
+
+      <section className="panel">
         <h2>Audio & subtitles</h2>
         <label className="field inline">
           <span>Preferred audio language</span>

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
-import { api, episodeCode, formatBitrate, formatDuration } from '../api.js';
+import { api, episodeCode, formatBitrate, formatDuration, prefetch, sized } from '../api.js';
+import { Img } from '../components/Cards.jsx';
 import { useAuth } from '../auth.jsx';
 import { Playback, parseVtt, cueHtml } from './engine.js';
 import { cancelBackgroundProbe } from './caps.js';
@@ -35,6 +36,20 @@ function Option({ on, onClick, children, hint }) {
       <span className="pmenu-check">{on && <IconCheck size={16} />}</span>
       <span className="pmenu-label">{children}</span>
       {hint && <span className="pmenu-hint">{hint}</span>}
+    </button>
+  );
+}
+
+/** Primary button that fills up while an automatic countdown runs (Netflix's "Next episode" button). */
+function CountdownButton({ upNext, onClick, children, big }) {
+  const p = upNext.auto ? (upNext.total - upNext.left) / upNext.total : 0;
+  return (
+    <button className={`btn btn-primary countdown-btn ${big ? '' : 'btn-sm'}`} onClick={onClick}>
+      {upNext.auto && <span className="countdown-fill" style={{ transform: `scaleX(${p})` }} aria-hidden="true" />}
+      <span className="countdown-label">
+        <IconNext size={big ? 20 : 16} /> {children}
+        {upNext.auto && upNext.left > 0 ? <span className="countdown-secs"> · {upNext.left}s</span> : null}
+      </span>
     </button>
   );
 }
@@ -76,6 +91,9 @@ export default function Player() {
   const [blocked, setBlocked] = useState(false);
   const [dismissedNext, setDismissedNext] = useState(false);
   const [started, setStarted] = useState(false);
+  const autoplayNext = prefs.autoplayNext !== false;
+  const autoplayRef = useRef(autoplayNext);
+  autoplayRef.current = autoplayNext;
 
   const say = useCallback((msg) => {
     setNotice(msg);
@@ -151,7 +169,14 @@ export default function Player() {
       canplay: () => setWaiting(false),
       seeking: () => setWaiting(true),
       seeked: () => setWaiting(false),
-      ended: () => goNext(true),
+      ended: () => {
+        const d = pbRef.current?.data;
+        // Episodes get an end screen (next episode, or "that was the last one"); movies just close.
+        if (d?.next || d?.item?.type === 'episode') {
+          setUpNext({ phase: 'end', left: d.next ? 8 : 12, total: d.next ? 8 : 12, auto: d.next ? autoplayRef.current : true });
+          setControls(true);
+        } else goNext(true);
+      },
       volumechange: () => {
         setMuted(v.muted);
         setVolume(v.volume);
@@ -305,22 +330,40 @@ export default function Player() {
     return () => window.removeEventListener('keydown', onKey);
   }, [togglePlay, skip, toggleFs, data, subIndex, goNext, exit, menu, poke]);
 
-  // ------------------------------------------------ up next
+  // ------------------------------------------------ up next (Netflix-style)
+  // During the credits: a "Next episode" panel. With a credits chapter in the file the panel counts
+  // down and moves on by itself; without one it only offers the button (a guess could cut off the
+  // last scene) and the end screen takes over when the episode finishes.
   const duration = data?.duration || 0;
   const remaining = duration - time;
+  const credits = useMemo(
+    () => data?.chapters?.find((c) => /credit|outro|end ?card|^end$/i.test(c.title || '') && c.start > duration * 0.6),
+    [data, duration]
+  );
   useEffect(() => {
+    if (upNext?.phase === 'end') {
+      if (remaining > 3) setUpNext(null); // seeked back after the end
+      return;
+    }
     if (!data?.next || dismissedNext) return;
-    const credits = data.chapters?.find((c) => /credit|end/i.test(c.title || '') && c.start > duration * 0.7);
-    const trigger = credits ? time >= credits.start : remaining <= 30 && duration > 300;
-    if (trigger && !upNext) setUpNext({ seconds: 15 });
-    if (!trigger && upNext && remaining > 35) setUpNext(null);
-  }, [time, remaining, data, duration, upNext, dismissedNext]);
+    const trigger = credits ? time >= credits.start : remaining <= 40 && duration > 300;
+    if (trigger && !upNext) {
+      setUpNext({ phase: 'credits', left: 10, total: 10, auto: autoplayNext && !!credits });
+      prefetch(`/api/items/${data.next.id}`);
+    }
+    if (!trigger && upNext?.phase === 'credits') setUpNext(null);
+  }, [time, remaining, data, duration, upNext, dismissedNext, credits, autoplayNext]);
   useEffect(() => {
-    if (!upNext || !playing) return;
-    if (upNext.seconds <= 0) return goNext();
-    const t = setTimeout(() => setUpNext((u) => (u ? { seconds: u.seconds - 1 } : u)), 1000);
+    if (!upNext?.auto) return;
+    if (upNext.phase === 'credits' && !playing) return; // paused: hold the countdown
+    if (upNext.left <= 0) return upNext.phase === 'end' && !data?.next ? exit() : goNext();
+    const t = setTimeout(() => setUpNext((u) => (u?.auto ? { ...u, left: u.left - 1 } : u)), 1000);
     return () => clearTimeout(t);
-  }, [upNext, playing, goNext]);
+  }, [upNext, playing, goNext, exit, data]);
+  const watchCredits = () => {
+    setUpNext(null);
+    setDismissedNext(true);
+  };
 
   // ------------------------------------------------ OS integration: media keys, lock screen, keep screen awake
   useEffect(() => {
@@ -453,15 +496,52 @@ export default function Player() {
 
       {stats && data && <Stats data={data} pb={pbRef.current} server={server} level={currentLevel} onClose={() => setStats(false)} />}
 
-      {upNext && data?.next && (
-        <div className="upnext">
-          <span className="upnext-label">Up next in {upNext.seconds}s</span>
-          <strong>{episodeCode(data.next)} · {data.next.title}</strong>
-          <div className="row-gap">
-            <button className="btn btn-primary" onClick={() => goNext()}>
-              <IconNext size={18} /> Play now
-            </button>
-            <button className="btn btn-glass" onClick={() => { setUpNext(null); setDismissedNext(true); }}>Keep watching</button>
+      {upNext?.phase === 'credits' && data?.next && (
+        <div className="upnext" role="dialog" aria-label="Next episode">
+          <button className="upnext-art" onClick={() => goNext()} aria-label={`Play ${episodeCode(data.next)} ${data.next.title}`}>
+            <Img src={sized(data.next.thumb, 220)} alt="" eager />
+            <span className="card-play" aria-hidden="true"><IconPlay size={18} /></span>
+          </button>
+          <div className="upnext-body">
+            <span className="upnext-label">Next episode</span>
+            <strong className="upnext-title">{episodeCode(data.next)} · {data.next.title}</strong>
+            <div className="row-gap">
+              <CountdownButton upNext={upNext} onClick={() => goNext()}>Next episode</CountdownButton>
+              <button className="btn btn-glass btn-sm" onClick={watchCredits}>Watch credits</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {upNext?.phase === 'end' && data && (
+        <div className="endcard" role="dialog" aria-label={data.next ? 'Up next' : 'Finished'}>
+          {data.next?.thumb && <Img className="endcard-bg" src={sized(data.next.thumb, 960)} alt="" eager />}
+          <div className="endcard-inner">
+            {data.next ? (
+              <>
+                <span className="upnext-label">Up next{data.item.showTitle ? ` in ${data.item.showTitle}` : ''}</span>
+                <button className="endcard-art" onClick={() => goNext()} aria-label={`Play ${data.next.title}`}>
+                  <Img src={sized(data.next.thumb, 480)} alt="" eager />
+                  <span className="card-play" aria-hidden="true"><IconPlay size={26} /></span>
+                </button>
+                <h2 className="endcard-title">{episodeCode(data.next)} · {data.next.title}</h2>
+                {data.next.overview && <p className="endcard-overview">{data.next.overview}</p>}
+                <div className="row-gap">
+                  <CountdownButton upNext={upNext} onClick={() => goNext()} big>Play next episode</CountdownButton>
+                  <button className="btn btn-glass" onClick={exit}>Back to {data.item.showTitle ? 'the series' : 'browse'}</button>
+                </div>
+              </>
+            ) : (
+              <>
+                <span className="upnext-label">{data.item.showTitle || 'Series'}</span>
+                <h2 className="endcard-title">That was the last episode</h2>
+                <p className="endcard-overview">You're all caught up. New episodes show up here as soon as they land in your library.</p>
+                <div className="row-gap">
+                  <button className="btn btn-primary" onClick={exit}>Back to the series</button>
+                  <button className="btn btn-glass" onClick={() => { setUpNext(null); seekTo(0); videoRef.current.play().catch(() => {}); }}>Watch again</button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
