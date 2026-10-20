@@ -20,13 +20,14 @@ Most "buffering…" on a good connection isn't the network — it's the server's
 | Original file too heavy for the link | Playback **starts immediately** with the remembered connection speed (first visit: a ≤1.2 s check); the full speed test only runs while you browse. The player then measures the real stream in its first ~1.5 s and switches to adaptive quality *before* the buffer runs dry if the connection can't carry the original. |
 | Buffering anyway | A **stall watchdog** that tells causes apart: a stall with an empty buffer (network) switches to adaptive streaming; a stall with data buffered (stuck decoder) gets a fresh restart at the same spot first. Decoder errors on a damaged section: restart → skip to the next keyframe → convert just that part and return to the original. |
 | Server can't keep up | The server **learns how fast it converts** each kind of source to each quality and only offers qualities it sustains at ≥1.3× real time. While playing, a conversion running under ~1.05× with < 20 s buffered steps down before the viewer sees a stall. CPU-only servers are never offered renditions above `MAX_SOFTWARE_HEIGHT` (default 1080p). |
+| Lip sync drifting after a seek | Direct stream keeps every track's **original timestamps** instead of restarting the clock per track, so picture and sound stay within a frame after seeks and resumes (checked in CI on a B-frame H.264 clip). |
 | GPU path breaks | VAAPI/NVENC jobs that fail fall back to hybrid (CPU decode/filters + GPU encode) and then pure CPU, automatically and invisibly. |
 | Background jobs fighting the stream | Thumbnail and subtitle extraction freeze whenever a player is open (any mode) and run in the idle disk-priority class. |
 
 ```mermaid
 flowchart LR
   A[Play] --> B{Browser can decode<br/>video codec? HDR ok?}
-  B -- no --> T[Adaptive HLS transcode<br/>H.264 ladder, 4s segments]
+  B -- no --> T[Adaptive HLS transcode<br/>H.264 ladder, 2s segments]
   B -- yes --> C{Bitrate fits the<br/>measured bandwidth?}
   C -- no --> T
   C -- yes --> D{MP4/WebM container<br/>+ supported audio?}

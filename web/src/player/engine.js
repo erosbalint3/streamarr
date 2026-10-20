@@ -254,6 +254,7 @@ export class Playback extends EventTarget {
     }
     this.data = data;
     this.offset = data.offset || 0;
+    this.tsOffset = data.tsOffset ?? this.offset;
     this.capped = false;
     this._hinted = false;
     this.recentStalls = [];
@@ -385,11 +386,12 @@ export class Playback extends EventTarget {
       if (skipPast != null) pos = r.offset + 0.05;
       if (!this.mse || gen !== this.mse.gen || this._loadInFlight || this.data?.sessionId !== sid) return;
       this.offset = r.offset;
+      this.tsOffset = r.tsOffset ?? r.offset;
       if (rebuild) {
         const wasPaused = this.video.paused;
         this._attach(r.url, pos);
         if (wasPaused) this.video.pause();
-      } else this._feed(r.url, r.offset);
+      } else this._feed(r.url, this.tsOffset);
     } catch (e) {
       if (this._loadInFlight || this.data?.sessionId !== sid) return;
       if (e.status === 404) this.emit('expired');
@@ -397,6 +399,7 @@ export class Playback extends EventTarget {
     }
   }
 
+  /** `offset`: SourceBuffer.timestampOffset that maps the stream's timestamps onto file time. */
   async _feed(url, offset, early = null) {
     const m = this.mse;
     if (!m?.sb) return;
@@ -567,10 +570,11 @@ export class Playback extends EventTarget {
       const mime = remuxMime(this.data.source);
       if (mime) {
         this.base = 0;
-        this._startMse(url, this.offset, start, mime, playWhenReady);
+        this._startMse(url, this.tsOffset, start, mime, playWhenReady);
         return;
       }
       this.base = this.offset; // progressive fallback: the stream's clock starts at the keyframe
+      url += `${url.includes('?') ? '&' : '?'}ts=zero`;
     } else this.base = 0;
 
     v.src = url;
@@ -606,8 +610,9 @@ export class Playback extends EventTarget {
     }
     const r = await api.post(`/api/playback/session/${this.data.sessionId}/seek`, { position: t });
     this.offset = r.offset;
+    this.tsOffset = r.tsOffset ?? r.offset;
     if (this.mse) {
-      this._feed(r.url, r.offset);
+      this._feed(r.url, this.tsOffset);
       return;
     }
     this._attach(r.url, t);

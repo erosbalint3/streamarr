@@ -145,13 +145,53 @@ export function hlsArgs({ media, rendition, audio, burn, level, settings, startS
   ];
 }
 
-/** Progressive fragmented-MP4 remux: video is copied, so it runs at disk speed. */
-export function remuxArgs({ media, audio, audioCopy, offset, stereo }) {
+/**
+ * Remux output timeline. Every track keeps its true timestamps from the file (shifted by this
+ * constant so nothing is negative), and the player maps them back with
+ * SourceBuffer.timestampOffset = remuxTimestampOffset(media).
+ *
+ * Why not restart the clock at zero: the fragmented-MP4 muxer starts *each track* at zero on its
+ * own. After a seek the copied video begins at a keyframe – and ffmpeg deliberately lands one
+ * keyframe early on files with B-frames – while the converted audio begins exactly at the seek
+ * point, so the picture ended up a whole keyframe interval (1–10 s) behind the sound. Even
+ * from the start, B-frame reordering put video ~80 ms behind.
+ */
+export const REMUX_TS_SHIFT = 10;
+export function remuxTimestampOffset(media) {
+  return -(media.video?.startTime || 0) - REMUX_TS_SHIFT;
+}
+
+/**
+ * Progressive fragmented-MP4 remux: video is copied, so it runs at disk speed.
+ * @param offset    keyframe to start from (seconds of file time)
+ * @param exact     drop everything before `offset` (used to step over a damaged section)
+ * @param zeroBased legacy clock starting at 0 at the keyframe, for players without MSE
+ */
+export function remuxArgs({ media, audio, audioCopy, offset, stereo, exact = false, zeroBased = false }) {
   const v = media.video;
+  const start = media.video?.startTime || 0;
+  // Skip mode: ffmpeg's seek lands up to a keyframe early on B-frame files; cut so the section being
+  // stepped over is really left out. The cut is compared with decode times, which run up to a few
+  // frames ahead of display times – hence the margin before the keyframe (earlier frames are not
+  // keyframes, so the copy still starts at this one).
+  const cut = exact && offset > 0 && !zeroBased ? offset + start - 0.25 : null;
+  const timing = zeroBased
+    ? ['-avoid_negative_ts', 'make_zero', '-movflags', 'frag_keyframe+empty_moov+default_base_moof']
+    : [
+        // Original timestamps, written as-is into every fragment (frag_discont: the first tfdt is the
+        // real decode time instead of 0; negative_cts_offsets: first frame's presentation time = its
+        // real one, no edit list needed – MSE ignores those).
+        // An output -ss (skip mode) restarts the clock at the cut; add it back so the timeline holds.
+        '-output_ts_offset', (REMUX_TS_SHIFT + (cut ?? 0)).toFixed(3),
+        '-use_editlist', '0',
+        '-movflags', 'frag_keyframe+empty_moov+default_base_moof+frag_discont+negative_cts_offsets',
+      ];
   return [
     '-hide_banner', '-loglevel', 'error', '-nostdin',
     ...(offset > 0 ? ['-ss', (offset + 0.001).toFixed(3)] : []),
+    ...(zeroBased ? [] : ['-copyts']),
     '-i', media.path,
+    ...(cut != null ? ['-ss', cut.toFixed(3)] : []),
     '-map', `0:${v.index}`,
     '-c:v', 'copy',
     ...(v.codec === 'hevc' ? ['-tag:v', 'hvc1'] : []),
@@ -163,8 +203,7 @@ export function remuxArgs({ media, audio, audioCopy, offset, stereo }) {
     ...audioArgs(audio, { copy: audioCopy, stereo }),
     '-sn', '-dn', '-map_metadata', '-1', '-map_chapters', '-1',
     '-max_muxing_queue_size', '4096',
-    '-avoid_negative_ts', 'make_zero',
-    '-movflags', 'frag_keyframe+empty_moov+default_base_moof',
+    ...timing,
     '-frag_duration', '2000000',
     '-f', 'mp4', 'pipe:1',
   ];

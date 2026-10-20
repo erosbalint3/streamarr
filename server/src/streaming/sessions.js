@@ -379,13 +379,15 @@ setInterval(() => {
 
 // ---------------------------------------------------------------- remux
 
-export function startRemux(session, offset) {
+export function startRemux(session, offset, { exact = false, zeroBased = false } = {}) {
   if (session.remux) session.remux.kill('SIGKILL');
   const args = remuxArgs({
     media: session.media,
     audio: session.decision.audio,
     audioCopy: session.decision.audioCopy,
     offset,
+    exact,
+    zeroBased,
     stereo: getSettings().stereoDownmix !== false,
   });
   const proc = spawn(config.ffmpeg, args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -404,9 +406,9 @@ export function startRemux(session, offset) {
  * opened the file and probed it by the time the player asks for the stream (~0.1–0.2 s saved, more
  * on spinning disks). Unclaimed after 15 s, it is discarded.
  */
-export function prestartRemux(session, offset) {
-  const proc = startRemux(session, offset);
-  session.prestart = { proc, offset };
+export function prestartRemux(session, offset, opts = {}) {
+  const proc = startRemux(session, offset, opts);
+  session.prestart = { proc, offset, exact: !!opts.exact, zeroBased: !!opts.zeroBased };
   setTimeout(() => {
     if (session.prestart?.proc !== proc) return;
     session.prestart = null;
@@ -416,11 +418,12 @@ export function prestartRemux(session, offset) {
 }
 
 /** The pre-started process if it matches this request, otherwise a fresh one. */
-export function takeRemux(session, offset) {
+export function takeRemux(session, offset, opts = {}) {
   const p = session.prestart;
   session.prestart = null;
-  if (p && Math.abs(p.offset - offset) < 0.002 && session.remux === p.proc && p.proc.exitCode == null && !p.proc.killed) return p.proc;
-  return startRemux(session, offset);
+  const same = p && Math.abs(p.offset - offset) < 0.002 && p.exact === !!opts.exact && p.zeroBased === !!opts.zeroBased;
+  if (same && session.remux === p.proc && p.proc.exitCode == null && !p.proc.killed) return p.proc;
+  return startRemux(session, offset, opts);
 }
 
 // ---------------------------------------------------------------- stats for the admin dashboard

@@ -7,6 +7,7 @@ import { getItem, card } from '../serialize.js';
 import { mediaForItem, audioLabel, subtitleLabel } from '../streaming/media.js';
 import { decide, pickDefaultTracks } from '../streaming/decision.js';
 import { keyframeBefore, keyframeAfter, inspectAround } from '../util/ffprobe.js';
+import { remuxTimestampOffset } from '../streaming/encoder.js';
 import { createSession, getSession, stopSession, masterPlaylist, mediaPlaylist, getSegment, prestartRemux, takeRemux, sessionSummary, segmentSeconds } from '../streaming/sessions.js';
 import { adjacentEpisode } from './library.js';
 
@@ -104,11 +105,13 @@ export default async function playbackRoutes(app) {
     const session = createSession({ user: req.user, item, media, decision, client: body.client, startPosition });
     let url;
     let offset = 0;
+    let tsOffset;
     if (decision.mode === 'direct') url = `/api/stream/${session.id}/direct`;
     else if (decision.mode === 'remux') {
       offset = await keyframeBefore(media.path, startPosition, media.video.startTime || 0);
       url = `/api/stream/${session.id}/remux?offset=${offset.toFixed(3)}`;
       prestartRemux(session, Number(offset.toFixed(3)));
+      tsOffset = remuxTimestampOffset(media);
     } else url = `/api/stream/${session.id}/master.m3u8`;
 
     let next = null;
@@ -123,6 +126,7 @@ export default async function playbackRoutes(app) {
       reasons: decision.reasons,
       url,
       offset,
+      tsOffset,
       startPosition,
       duration: media.duration,
       segmentSeconds: segmentSeconds(),
@@ -161,8 +165,9 @@ export default async function playbackRoutes(app) {
     const offset = req.body?.after
       ? Math.min(await keyframeAfter(s.media.path, t, s.media.video.startTime || 0), s.media.duration - 1)
       : await keyframeBefore(s.media.path, t, s.media.video.startTime || 0);
-    prestartRemux(s, Number(offset.toFixed(3)));
-    return { url: `/api/stream/${s.id}/remux?offset=${offset.toFixed(3)}`, offset };
+    const exact = !!req.body?.after;
+    prestartRemux(s, Number(offset.toFixed(3)), { exact });
+    return { url: `/api/stream/${s.id}/remux?offset=${offset.toFixed(3)}${exact ? '&exact=1' : ''}`, offset, tsOffset: remuxTimestampOffset(s.media) };
   });
 
   app.post('/api/playback/session/:sid/progress', async (req, reply) => {
@@ -257,7 +262,8 @@ export default async function playbackRoutes(app) {
     const s = getSession(req.params.sid);
     if (!s) return reply.code(404).send();
     const offset = Math.max(0, Number(req.query.offset) || 0);
-    const proc = takeRemux(s, offset);
+    // MSE players get true timestamps; ts=zero is the old clock for players fed by <video src>.
+    const proc = takeRemux(s, offset, { exact: req.query.exact === '1', zeroBased: req.query.ts === 'zero' });
     reply.hijack();
     reply.raw.writeHead(200, {
       'Content-Type': 'video/mp4',

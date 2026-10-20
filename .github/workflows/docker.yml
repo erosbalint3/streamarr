@@ -75,4 +75,6 @@ jobs:
           docker exec sa sh -c 'cat /proc/1/status /proc/$(pgrep -f "server/src/index.js")/status | grep -E "^Uid"'
           docker exec sa ffmpeg -hide_banner -encoders | grep -E "libx264|h264_vaapi|h264_nvenc"
           docker exec sa ffmpeg -hide_banner -filters | grep -E " zscale| tonemap | scale_vaapi| scale_cuda"
+          # Direct stream keeps picture and sound in sync after seeks (B-frame H.264, the image's ffmpeg).
+          docker exec sa node server/test/avsync.mjs
           docker logs sa
