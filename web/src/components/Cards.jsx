@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { episodeCode, formatDuration } from '../api.js';
+import { episodeCode, formatDuration, prefetch, sized } from '../api.js';
 import { IconCheck, IconPlay } from './Icons.jsx';
 
 const TINTS = [
@@ -67,12 +67,25 @@ function Badge({ item }) {
   return null;
 }
 
+/** Hovering or focusing a card for a moment loads its page data, so the click opens instantly. */
+function usePrefetch(id) {
+  const timer = useRef(null);
+  return {
+    onPointerEnter: () => {
+      timer.current = setTimeout(() => prefetch(`/api/items/${id}`), 120);
+    },
+    onPointerLeave: () => clearTimeout(timer.current),
+    onFocus: () => prefetch(`/api/items/${id}`),
+  };
+}
+
 export function PosterCard({ item }) {
+  const pf = usePrefetch(item.id);
   const sub = item.type === 'season' ? (item.episodeCount ? `${item.episodeCount} episodes` : null) : item.year;
   return (
-    <Link to={`/item/${item.id}`} className="card card-poster">
+    <Link to={`/item/${item.id}`} className="card card-poster" {...pf}>
       <div className="card-art">
-        <Img src={item.poster} alt="" fallback={<TypePoster title={item.title} year={item.year} />} />
+        <Img src={sized(item.poster, 190)} alt="" fallback={<TypePoster title={item.title} year={item.year} />} />
         {item.posterIsFrame && (
           <div className="frameposter" aria-hidden="true">
             <span className="typeposter-title">{item.title}</span>
@@ -99,10 +112,11 @@ export function LandscapeCard({ item, playable = true }) {
   const sub = isEpisode ? `${episodeCode(item)} · ${item.title}` : item.year;
   const remaining = item.progress && item.runtime ? Math.max(1, Math.round(item.runtime * (1 - item.progress))) : null;
   const go = () => navigate(playable ? `/play/${item.id}` : `/item/${item.id}`);
+  const pf = usePrefetch(isEpisode && item.showId ? item.showId : item.id);
   return (
-    <div className="card card-landscape">
+    <div className="card card-landscape" {...pf}>
       <button className="card-art" onClick={go} aria-label={`Play ${title} ${sub || ''}`}>
-        <Img src={art} alt="" fallback={<TypePoster title={title} small />} />
+        <Img src={sized(art, 340)} alt="" fallback={<TypePoster title={title} small />} />
         <span className="card-play" aria-hidden="true">
           <IconPlay size={22} />
         </span>
@@ -125,7 +139,7 @@ export function EpisodeRow({ ep, onToggleWatched }) {
   return (
     <div className={`episode ${ep.watched ? 'is-watched' : ''}`}>
       <button className="episode-art" onClick={() => navigate(`/play/${ep.id}`)} aria-label={`Play episode ${ep.episodeNumber}`}>
-        <Img src={ep.thumb} alt="" fallback={<TypePoster title={ep.title} small />} />
+        <Img src={sized(ep.thumb, 240)} alt="" fallback={<TypePoster title={ep.title} small />} />
         <span className="card-play" aria-hidden="true">
           <IconPlay size={20} />
         </span>

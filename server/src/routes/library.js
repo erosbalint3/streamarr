@@ -369,10 +369,11 @@ export default async function libraryRoutes(app) {
   });
 
   // ---------------- images & assets
-  app.get('/api/images/:id/:kind', { preHandler: requireUser }, async (req, reply) => {
+  app.get('/api/images/:id/:kind', { preHandler: requireUser, compress: false }, async (req, reply) => {
     if (!['poster', 'backdrop', 'thumb', 'logo'].includes(req.params.kind)) return reply.code(404).send();
     try {
-      const file = await resolveImage(Number(req.params.id), req.params.kind);
+      const w = Math.max(0, Math.min(Number(req.query.w) || 0, 1920));
+      const file = await resolveImage(Number(req.params.id), req.params.kind, w);
       if (!file) return reply.code(404).send();
       return sendImage(reply, req, file);
     } catch {
@@ -380,7 +381,7 @@ export default async function libraryRoutes(app) {
     }
   });
 
-  app.get('/api/tmdb-image/:size/:file', { preHandler: requireUser }, async (req, reply) => {
+  app.get('/api/tmdb-image/:size/:file', { preHandler: requireUser, compress: false }, async (req, reply) => {
     try {
       const file = await tmdbImage(`${req.params.size}/${req.params.file}`);
       return sendImage(reply, req, file);
@@ -389,7 +390,7 @@ export default async function libraryRoutes(app) {
     }
   });
 
-  app.get('/api/media/:itemId/trickplay/:n', { preHandler: requireUser }, async (req, reply) => {
+  app.get('/api/media/:itemId/trickplay/:n', { preHandler: requireUser, compress: false }, async (req, reply) => {
     const media = mediaForItem(Number(req.params.itemId));
     const n = parseInt(req.params.n, 10);
     if (!media?.trickplay || !Number.isFinite(n)) return reply.code(404).send();

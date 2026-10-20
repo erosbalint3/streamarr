@@ -1,20 +1,15 @@
-import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api } from '../api.js';
 import { useAuth } from '../auth.jsx';
+import { useApi, useScrollRestore } from '../hooks.js';
 import Hero from '../components/Hero.jsx';
 import Row from '../components/Row.jsx';
 
 export default function Home() {
   const { user } = useAuth();
-  const [data, setData] = useState(null);
-  const [error, setError] = useState('');
+  const { data, error } = useApi('/api/home');
+  useScrollRestore(!!data);
 
-  useEffect(() => {
-    api.get('/api/home').then(setData).catch((e) => setError(e.message));
-  }, []);
-
-  if (error) return <div className="empty"><p>{error}</p></div>;
+  if (error) return <div className="empty"><p>{error.message}</p></div>;
   if (!data) return <div className="home-skeleton" aria-busy="true" />;
 
   if (!data.rows.length && !data.hero.length) {

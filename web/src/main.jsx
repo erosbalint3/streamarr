@@ -1,4 +1,4 @@
-import { StrictMode, Suspense, lazy } from 'react';
+import { StrictMode, Suspense, lazy, useEffect } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter, Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import '@fontsource-variable/bricolage-grotesque/standard.css';
@@ -15,8 +15,9 @@ import Item from './pages/Item.jsx';
 import Search from './pages/Search.jsx';
 import Settings from './pages/Settings.jsx';
 import { Login, Setup } from './pages/Login.jsx';
-// The player (hls.js) and dashboard load on demand to keep the first paint light.
-const Player = lazy(() => import('./player/Player.jsx'));
+// The player (hls.js) and dashboard load on demand to keep the first paint light…
+const loadPlayer = () => import('./player/Player.jsx');
+const Player = lazy(loadPlayer);
 const Admin = lazy(() => import('./pages/Admin.jsx'));
 
 function Gate({ children }) {
@@ -29,6 +30,17 @@ function Gate({ children }) {
 }
 
 function Shell({ children }) {
+  // …but the player is fetched as soon as the browser is idle, so pressing Play never waits for it.
+  // While browsing (never while watching) keep the connection estimate fresh for the next play.
+  useEffect(() => {
+    const idle = window.requestIdleCallback || ((fn) => setTimeout(fn, 1500));
+    idle(() => {
+      loadPlayer().catch(() => {});
+      // hls.js after that, at lower priority (only Converted streams need it).
+      setTimeout(() => import('./player/engine.js').then((m) => m.loadHls()).catch(() => {}), 4000);
+      import('./player/caps.js').then((m) => m.refreshBandwidthWhenIdle()).catch(() => {});
+    });
+  }, []);
   return (
     <>
       <Nav />

@@ -15,6 +15,9 @@ export function queueArtwork() {
   for (const r of rows) {
     enqueue(`art:${r.id}`, `Artwork: ${r.title}`, async () => {
       for (const kind of ['poster', 'backdrop']) await resolveImage(r.id, kind).catch(() => null);
+      // The sizes cards actually display, so the first library view doesn't wait for resizing.
+      for (const w of [200, 500]) await resolveImage(r.id, 'poster', w).catch(() => null);
+      for (const w of [342, 780]) await resolveImage(r.id, 'backdrop', w).catch(() => null);
     }, { priority: true });
   }
 }

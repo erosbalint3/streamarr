@@ -21,6 +21,7 @@ import { config } from '../config.js';
 import { getSettings, run } from '../db.js';
 import { hlsArgs, remuxArgs, levelsFor, codecString } from './encoder.js';
 import { audioBitrateFor } from './decision.js';
+import { recordSpeed, statKey } from './encoderStats.js';
 import { setBackgroundPaused } from '../tasks.js';
 import { sleep } from '../util/proc.js';
 
@@ -185,6 +186,7 @@ function startJob(session, rs, startSegment) {
       const k = line.slice(0, eq);
       const val = line.slice(eq + 1).trim();
       if (k === 'speed') job.speed = parseFloat(val) || job.speed;
+      else if (k === 'out_time_us') job.outUs = Number(val) || job.outUs;
       else if (k === 'fps') job.fps = parseFloat(val) || job.fps;
     }
   });
@@ -277,11 +279,32 @@ function pause(job) {
   if (job.paused || job.exited) return;
   job.proc.kill('SIGSTOP');
   job.paused = true;
+  job.sample = null;
 }
 function resume(job) {
   if (!job.paused || job.exited) return;
   job.proc.kill('SIGCONT');
   job.paused = false;
+  job.sample = null;
+}
+
+/**
+ * Real-time factor measured over the last few seconds of actual encoding (ffmpeg's own "speed" is
+ * an average since start that includes time spent paused). Feeds the learned speed table.
+ */
+function sampleSpeed(session, rs, job, now) {
+  if (job.paused || job.exited || !job.outUs) return;
+  if (!job.sample) {
+    job.sample = { t: now, us: job.outUs };
+    return;
+  }
+  if (now - job.sample.t < 4000) return;
+  const speed = (job.outUs - job.sample.us) / 1e6 / ((now - job.sample.t) / 1000);
+  job.sample = { t: now, us: job.outUs };
+  if (!(speed > 0)) return;
+  job.liveSpeed = speed;
+  // Skip the warm-up (probing, first keyframe, lookahead) so it doesn't skew the table.
+  if (now - job.startedAt > 8000) recordSpeed(statKey(session.media, rs.height, `${getSettings().hwaccel}/${job.level}`), speed);
 }
 
 function aheadSegments() {
@@ -345,6 +368,7 @@ setInterval(() => {
         pause(job);
         continue;
       }
+      sampleSpeed(s, rs, job, now);
       const ahead = job.produced - rs.lastRequested;
       if (!job.paused && ahead > aheadSegments()) pause(job);
       else maybeResume(rs);
@@ -373,6 +397,30 @@ export function startRemux(session, offset) {
   });
   session.remux = proc;
   return proc;
+}
+
+/**
+ * Start the remux while the /start response is still on its way to the player, so the process has
+ * opened the file and probed it by the time the player asks for the stream (~0.1–0.2 s saved, more
+ * on spinning disks). Unclaimed after 15 s, it is discarded.
+ */
+export function prestartRemux(session, offset) {
+  const proc = startRemux(session, offset);
+  session.prestart = { proc, offset };
+  setTimeout(() => {
+    if (session.prestart?.proc !== proc) return;
+    session.prestart = null;
+    if (session.remux === proc) session.remux = null;
+    proc.kill('SIGKILL');
+  }, 15000).unref();
+}
+
+/** The pre-started process if it matches this request, otherwise a fresh one. */
+export function takeRemux(session, offset) {
+  const p = session.prestart;
+  session.prestart = null;
+  if (p && Math.abs(p.offset - offset) < 0.002 && session.remux === p.proc && p.proc.exitCode == null && !p.proc.killed) return p.proc;
+  return startRemux(session, offset);
 }
 
 // ---------------------------------------------------------------- stats for the admin dashboard
@@ -407,7 +455,8 @@ export function sessionSummary(s) {
           rendition: rs.id,
           bitrate: rs.bitrate,
           level: s.level,
-          speed: job?.speed ?? null,
+          speed: job ? (job.liveSpeed ?? job.speed ?? null) : null,
+          age: job ? Math.round((Date.now() - job.startedAt) / 1000) : 0,
           fps: job?.fps ?? null,
           throttled: !!job?.paused,
           running: !!job && !job.exited,

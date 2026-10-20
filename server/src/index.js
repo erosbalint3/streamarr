@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import Fastify from 'fastify';
 import fastifyStatic from '@fastify/static';
+import fastifyCompress from '@fastify/compress';
 import { config } from './config.js';
 import './db.js';
 import authRoutes from './routes/auth.js';
@@ -22,6 +23,10 @@ const app = Fastify({
   keepAliveTimeout: 65000,
 });
 
+// Compress API JSON and playlists (media, images and the speed test are left alone: their types
+// aren't compressible, and the speed test must measure raw throughput).
+await app.register(fastifyCompress, { global: true, threshold: 1024, encodings: ['br', 'gzip'], brotliOptions: { params: { 1: 4 } } });
+
 await app.register(authRoutes);
 await app.register(libraryRoutes);
 await app.register(playbackRoutes);
@@ -32,6 +37,8 @@ app.get('/api/health', async () => ({ ok: true }));
 if (fs.existsSync(config.webDir)) {
   await app.register(fastifyStatic, {
     root: config.webDir,
+    // Serve the .br / .gz files produced at build time (no compression work per request).
+    preCompressed: true,
     setHeaders(res, file) {
       if (file.includes(`${path.sep}assets${path.sep}`)) res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
       else res.setHeader('Cache-Control', 'no-cache');

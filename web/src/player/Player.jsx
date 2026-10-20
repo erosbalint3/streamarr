@@ -3,6 +3,7 @@ import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
 import { api, episodeCode, formatBitrate, formatDuration } from '../api.js';
 import { useAuth } from '../auth.jsx';
 import { Playback, parseVtt, cueHtml } from './engine.js';
+import { cancelBackgroundProbe } from './caps.js';
 import Stats from './Stats.jsx';
 import {
   IconPlay, IconPause, IconBack10, IconFwd10, IconVolume, IconMute, IconFullscreen, IconExitFullscreen,
@@ -74,6 +75,7 @@ export default function Player() {
   const [upNext, setUpNext] = useState(null);
   const [blocked, setBlocked] = useState(false);
   const [dismissedNext, setDismissedNext] = useState(false);
+  const [started, setStarted] = useState(false);
 
   const say = useCallback((msg) => {
     setNotice(msg);
@@ -83,6 +85,7 @@ export default function Player() {
 
   // ------------------------------------------------ session lifecycle
   useEffect(() => {
+    cancelBackgroundProbe(); // never let a speed test compete with the stream
     const video = videoRef.current;
     const pb = new Playback(video);
     pbRef.current = pb;
@@ -91,6 +94,7 @@ export default function Player() {
     setUpNext(null);
     setDismissedNext(false);
     setWaiting(true);
+    setStarted(false);
 
     pb.addEventListener('session', (e) => {
       const d = e.detail;
@@ -142,6 +146,7 @@ export default function Player() {
       playing: () => {
         setWaiting(false);
         setBlocked(false);
+        setStarted(true);
       },
       canplay: () => setWaiting(false),
       seeking: () => setWaiting(true),
@@ -398,6 +403,9 @@ export default function Player() {
       style={{ '--sub-scale': prefs.subtitleSize || 1 }}
     >
       <video ref={videoRef} className="player-video" playsInline preload="auto" onClick={togglePlay} onDoubleClick={toggleFs} />
+
+      {/* Artwork while the stream starts, instead of a black screen. */}
+      {!started && <div className="player-poster" style={{ backgroundImage: `url(/api/images/${id}/backdrop)` }} aria-hidden="true" />}
 
       {activeCue && <div className={`player-subs ${controls ? 'lifted' : ''}`} dangerouslySetInnerHTML={{ __html: activeCue }} />}
 

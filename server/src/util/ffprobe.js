@@ -155,27 +155,53 @@ export async function findExternalSubtitles(file) {
   return subs;
 }
 
-/** Find the last video keyframe at or before `t` (seconds). Used for exact remux seeking. */
+async function keyframesIn(file, from, to) {
+  const out = await exec(
+    config.ffprobe,
+    ['-v', 'error', '-select_streams', 'v:0', '-read_intervals', `${from}%${to}`, '-show_entries', 'packet=pts_time,flags', '-of', 'csv=p=0', file],
+    { timeout: 15000 }
+  );
+  const keys = [];
+  for (const line of out.toString().split('\n')) {
+    const [pts, flags] = line.split(',');
+    const p = Number(pts);
+    if (flags?.includes('K') && Number.isFinite(p)) keys.push(p);
+  }
+  return keys.sort((a, b) => a - b);
+}
+
+/**
+ * Last video keyframe at or before `t` (seconds, file time). Used for exact remux seeking.
+ * Reads a short window first: keyframes are rarely > 8 s apart, and on a hard drive every
+ * second of a 40 Mbps file read here is ~5 MB of extra seek latency.
+ */
 export async function keyframeBefore(file, t, startTime = 0) {
   if (t <= 0.5) return 0;
   const abs = t + startTime;
-  const from = Math.max(0, abs - 30);
   try {
-    const out = await exec(
-      config.ffprobe,
-      ['-v', 'error', '-select_streams', 'v:0', '-read_intervals', `${from}%${abs + 0.05}`, '-show_entries', 'packet=pts_time,flags', '-of', 'csv=p=0', file],
-      { timeout: 15000 }
-    );
-    let best = null;
-    for (const line of out.toString().split('\n')) {
-      const [pts, flags] = line.split(',');
-      const p = Number(pts);
-      if (flags?.includes('K') && Number.isFinite(p) && p <= abs + 0.001) best = best == null ? p : Math.max(best, p);
+    for (const span of [8, 30]) {
+      const keys = (await keyframesIn(file, Math.max(0, abs - span), abs + 0.05)).filter((p) => p <= abs + 0.001);
+      if (keys.length) return Math.max(0, keys[keys.length - 1] - startTime);
+      if (abs - span <= 0) return 0;
     }
-    return best == null ? t : Math.max(0, best - startTime);
+    return Math.max(0, t - 30);
   } catch {
     return t;
   }
+}
+
+/** First video keyframe strictly after `t` – used to step over a section a decoder rejects. */
+export async function keyframeAfter(file, t, startTime = 0) {
+  const abs = t + startTime;
+  try {
+    for (const span of [10, 40]) {
+      const keys = (await keyframesIn(file, abs, abs + span)).filter((p) => p > abs + 0.04);
+      if (keys.length) return keys[0] - startTime;
+    }
+  } catch {
+    /* fall through */
+  }
+  return t + 2;
 }
 
 /**

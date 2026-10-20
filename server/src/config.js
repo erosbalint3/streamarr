@@ -37,7 +37,8 @@ export const settingDefaults = {
   // How far (seconds) the transcoder runs ahead of the furthest segment the player asked for
   // before it is paused. Big = resilient to network hiccups; Plex uses ~60s.
   transcodeAheadSeconds: Number(process.env.TRANSCODE_AHEAD_SECONDS || 240),
-  segmentSeconds: 4,
+  // Short segments: the first picture after starting or seeking a conversion needs only 2 s encoded.
+  segmentSeconds: 2,
   maxSoftwareHeight: Number(process.env.MAX_SOFTWARE_HEIGHT || 1080),
   stereoDownmix: true,
   trickplay: process.env.TRICKPLAY !== 'false',

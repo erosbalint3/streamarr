@@ -1,6 +1,5 @@
-import Hls from 'hls.js';
 import { api } from '../api.js';
-import { detectCaps, measureBandwidth } from './caps.js';
+import { detectCaps, measureBandwidth, quickBandwidth, saveBandwidth } from './caps.js';
 
 export { detectCaps, measureBandwidth };
 
@@ -73,16 +72,23 @@ export function remuxMime(source) {
  * that as a slow network, aborts the download and switches down – which starts a second encoder
  * and makes everything slower. Keep the normal bandwidth-based choice, drop the emergency abort.
  */
-const BaseAbr = Hls.DefaultConfig.abrController;
-class TranscodeAbrController extends BaseAbr {
-  constructor(hls) {
-    super(hls);
-    this._abandonRulesCheck = () => {};
-  }
+let hlsPromise = null;
+/** hls.js (~600 KB) is only needed for converted streams: load it on demand, once. */
+export function loadHls() {
+  hlsPromise ||= import('hls.js').then(({ default: Hls }) => {
+    const BaseAbr = Hls.DefaultConfig.abrController;
+    class TranscodeAbrController extends BaseAbr {
+      constructor(hls) {
+        super(hls);
+        this._abandonRulesCheck = () => {};
+      }
+    }
+    return { Hls, config: { ...HLS_CONFIG, abrController: TranscodeAbrController } };
+  });
+  return hlsPromise;
 }
 
 const HLS_CONFIG = {
-  abrController: TranscodeAbrController,
   // A deep forward buffer rides out Wi-Fi dips, but it has to fit the browser's SourceBuffer
   // memory (~150 MB in Chrome); overshooting causes "buffer full" errors and stalls.
   maxBufferLength: 60,
@@ -227,7 +233,7 @@ export class Playback extends EventTarget {
   async _load(opts) {
     this.opts = { ...this.opts, ...opts };
     const caps = detectCaps();
-    if (!this.bandwidth) this.bandwidth = await measureBandwidth();
+    if (!this.bandwidth) this.bandwidth = await quickBandwidth();
     const body = {
       caps,
       bandwidth: this.bandwidth,
@@ -283,6 +289,11 @@ export class Playback extends EventTarget {
     const bps = Math.max(1e6, this.data?.source?.bitrate || 8e6);
     const limit = Math.max(12, Math.min(MSE_MAX_AHEAD, (MSE_BYTE_BUDGET * 8) / bps));
     this.mse = { ms, sb: null, gen: 0, ctrl: null, objUrl, limit, mime };
+    // Request the stream right away, in parallel with the MediaSource opening.
+    const ctrl = new AbortController();
+    this.mse.ctrl = ctrl;
+    const early = { url, ctrl, res: fetch(url, { signal: ctrl.signal, credentials: 'same-origin' }) };
+    early.res.catch(() => {});
     ms.addEventListener(
       'sourceopen',
       () => {
@@ -296,7 +307,7 @@ export class Playback extends EventTarget {
           this.emit('error', { message: `This browser rejected the stream (${e.message}).` });
           return;
         }
-        this._feed(url, offset);
+        this._feed(url, offset, early);
         v.currentTime = start || 0;
         play();
       },
@@ -353,7 +364,7 @@ export class Playback extends EventTarget {
     return this.video.currentTime + this.bufferedAhead();
   }
 
-  async _recoverFeed(gen, reason, rebuild) {
+  async _recoverFeed(gen, reason, rebuild, skipPast = null) {
     const m = this.mse;
     if (!m || gen !== m.gen || this.destroyed) return;
     this.recoveries = (this.recoveries || 0) + 1;
@@ -368,8 +379,10 @@ export class Playback extends EventTarget {
     if (!this.mse || gen !== this.mse.gen || this.destroyed || this._loadInFlight) return;
     const sid = this.data.sessionId;
     try {
-      const pos = rebuild ? this.currentTime : this._bufferEnd();
-      const r = await api.post(`/api/playback/session/${sid}/seek`, { position: pos });
+      let pos = rebuild ? this.currentTime : this._bufferEnd();
+      const body = skipPast != null ? { position: skipPast, after: true } : { position: pos };
+      const r = await api.post(`/api/playback/session/${sid}/seek`, body);
+      if (skipPast != null) pos = r.offset + 0.05;
       if (!this.mse || gen !== this.mse.gen || this._loadInFlight || this.data?.sessionId !== sid) return;
       this.offset = r.offset;
       if (rebuild) {
@@ -380,16 +393,16 @@ export class Playback extends EventTarget {
     } catch (e) {
       if (this._loadInFlight || this.data?.sessionId !== sid) return;
       if (e.status === 404) this.emit('expired');
-      else this._recoverFeed(gen, e.message, rebuild);
+      else this._recoverFeed(gen, e.message, rebuild, skipPast);
     }
   }
 
-  async _feed(url, offset) {
+  async _feed(url, offset, early = null) {
     const m = this.mse;
     if (!m?.sb) return;
     const gen = ++m.gen;
-    m.ctrl?.abort();
-    const ctrl = new AbortController();
+    if (!early || m.ctrl !== early.ctrl) m.ctrl?.abort();
+    const ctrl = early?.ctrl || new AbortController();
     m.ctrl = ctrl;
     const sb = m.sb;
     await this._sbIdle(sb);
@@ -402,7 +415,7 @@ export class Playback extends EventTarget {
     }
     let reader;
     try {
-      const res = await fetch(url, { signal: ctrl.signal, credentials: 'same-origin' });
+      const res = await (early?.res || fetch(url, { signal: ctrl.signal, credentials: 'same-origin' }));
       if (!res.ok) throw new Error(`stream ${res.status}`);
       reader = res.body.getReader();
     } catch (e) {
@@ -431,12 +444,33 @@ export class Playback extends EventTarget {
       }
       m.retries = 0;
     };
+    // Throughput of the real stream (Netflix-style: measure what you play, not a test file).
+    let burstStart = performance.now();
+    let burstBytes = 0;
+    let measured = false;
     try {
       for (;;) {
         // Backpressure: stop reading once we're far enough ahead; TCP then pauses the server's ffmpeg.
-        while (gen === m.gen && this._mseAhead() > this._mseLimit()) await sleep(400);
+        if (this._mseAhead() > this._mseLimit()) {
+          while (gen === m.gen && this._mseAhead() > this._mseLimit()) await sleep(400);
+          burstStart = performance.now();
+          burstBytes = 0;
+        }
         if (gen !== m.gen) break;
         const { done, value } = await reader.read();
+        if (value) {
+          burstBytes += value.length;
+          const el = performance.now() - burstStart;
+          // Enough data to judge: a few MB on fast links, or ~1.5 s on slow ones (decide before the
+          // initial buffer drains).
+          if (!measured && ((burstBytes > 6 * 1024 * 1024 && el > 300) || (burstBytes > 1024 * 1024 && el > 1500))) {
+            measured = true;
+            const bps = (burstBytes * 8) / (el / 1000);
+            this.bandwidth = Math.round(bps);
+            saveBandwidth(bps, 'stream');
+            this._checkThroughput(bps);
+          }
+        }
         if (gen !== m.gen) break;
         if (done) {
           await flush();
@@ -483,6 +517,7 @@ export class Playback extends EventTarget {
     this.stallSnap = null;
     const v = this.video;
     this._destroyHls();
+    this._attachToken = null;
     const mode = this.data.mode;
     const playWhenReady = () => {
       const p = v.play();
@@ -496,31 +531,35 @@ export class Playback extends EventTarget {
       return;
     }
     if (mode === 'transcode' && detectCaps().hls === 'mse') {
-      const hls = new Hls({
-        ...HLS_CONFIG,
-        startPosition: start || 0,
-        abrEwmaDefaultEstimate: this.bandwidth ? Math.round(this.bandwidth * 0.8) : 5_000_000,
-        startLevel: -1,
-      });
-      this.hls = hls;
-      hls.on(Hls.Events.LEVEL_SWITCHED, (_, d) => this.emit('level', { level: d.level }));
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        this.emit('levels', { levels: hls.levels });
-        playWhenReady();
-      });
-      let mediaRecoveries = 0;
-      hls.on(Hls.Events.ERROR, (_, d) => {
-        if (!d.fatal) return;
-        if (d.type === Hls.ErrorTypes.NETWORK_ERROR) {
-          setTimeout(() => this.hls === hls && hls.startLoad(), 1500);
-        } else if (d.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries++ < 3) {
-          hls.recoverMediaError();
-        } else {
-          this.emit('error', { message: `Playback failed (${d.details}).` });
-        }
-      });
-      hls.loadSource(url);
-      hls.attachMedia(v);
+      const token = (this._attachToken = {});
+      loadHls().then(({ Hls, config }) => {
+        if (this._attachToken !== token || this.destroyed) return; // superseded meanwhile
+        const hls = new Hls({
+          ...config,
+          startPosition: start || 0,
+          abrEwmaDefaultEstimate: this.bandwidth ? Math.round(this.bandwidth * 0.8) : 5_000_000,
+          startLevel: -1,
+        });
+        this.hls = hls;
+        hls.on(Hls.Events.LEVEL_SWITCHED, (_, d) => this.emit('level', { level: d.level }));
+        hls.on(Hls.Events.MANIFEST_PARSED, () => {
+          this.emit('levels', { levels: hls.levels });
+          playWhenReady();
+        });
+        let mediaRecoveries = 0;
+        hls.on(Hls.Events.ERROR, (_, d) => {
+          if (!d.fatal) return;
+          if (d.type === Hls.ErrorTypes.NETWORK_ERROR) {
+            setTimeout(() => this.hls === hls && hls.startLoad(), 1500);
+          } else if (d.type === Hls.ErrorTypes.MEDIA_ERROR && mediaRecoveries++ < 3) {
+            hls.recoverMediaError();
+          } else {
+            this.emit('error', { message: `Playback failed (${d.details}).` });
+          }
+        });
+        hls.loadSource(url);
+        hls.attachMedia(v);
+      }, () => this.emit('error', { message: 'Couldn\'t load the streaming component. Check your connection and try again.' }));
       return;
     }
 
@@ -560,7 +599,11 @@ export class Playback extends EventTarget {
     // Outside the buffered window: restart the remux at the nearest keyframe before t.
     this.seeking = true;
     this.emit('reloading');
-    if (this.mse) this.video.currentTime = t;
+    if (this.mse) {
+      this.mse.gen++;
+      this.mse.ctrl?.abort();
+      this.video.currentTime = t;
+    }
     const r = await api.post(`/api/playback/session/${this.data.sessionId}/seek`, { position: t });
     this.offset = r.offset;
     if (this.mse) {
@@ -646,7 +689,9 @@ export class Playback extends EventTarget {
   _onMediaError() {
     const v = this.video;
     const err = v.error;
-    if (!err || this.destroyed || !this.data || this.hls || this.sourceLoading) return;
+    // (Errors while a restarted stream is still starting count too – that is exactly when a
+    // damaged section right after a skip shows up. Only a reload already in flight is ignored.)
+    if (!err || this.destroyed || !this.data || this.hls || this._loadInFlight) return;
     if (err.code !== 3 && err.code !== 4) return; // decode / unsupported data
     // Browsers can fire several error events for one failure: handle each stream's failure once.
     if (this._erroredSrc === v.currentSrc) return;
@@ -660,15 +705,38 @@ export class Playback extends EventTarget {
     }
     if (this.mode === 'remux') {
       const prev = this._decodeErr;
-      this._decodeErr = { pos, at: Date.now() };
-      if (!prev || Math.abs(pos - prev.pos) > 60 || Date.now() - prev.at > 5 * 60 * 1000) {
+      const same = prev && Math.abs(pos - prev.pos) < 60 && Date.now() - prev.at < 5 * 60 * 1000;
+      const count = same ? prev.count + 1 : 1;
+      this._decodeErr = { pos, at: Date.now(), count };
+      if (count === 1) {
+        // Often transient: a fresh decoder at the same spot.
         this._recoverFeed(this.mse?.gen ?? 0, 'decode error', true);
+        return;
+      }
+      if (count === 2) {
+        // Same spot again: the data there is unusable for this decoder. Jump to the next keyframe
+        // (usually < 1 s) – far less disruptive than converting.
+        this.emit('fallback', { reason: 'Skipped a damaged moment in the file.' });
+        this._recoverFeed(this.mse?.gen ?? 0, 'decode error, skipping', true, pos + 0.05);
         return;
       }
       this._returnToOriginalAt = pos + 45;
       this.emit('fallback', { reason: 'Your browser can\'t decode this part of the file – converting it for a moment.' });
       this.reload({ forceMode: 'transcode', startPosition: pos, keepPlaying: true });
     }
+  }
+
+  /**
+   * The original file arrives slower than it plays (e.g. the remembered speed was from another
+   * network): switch to adaptive quality *before* the buffer runs dry, like Netflix does.
+   */
+  _checkThroughput(bps) {
+    const need = (this.data?.source?.bitrate || 0) * 1.15;
+    if (this.mode === 'transcode' || this._fellBack || !need || bps >= need) return;
+    if (this.opts.quality && this.opts.quality !== 'auto') return; // the viewer chose this quality
+    this._fellBack = true;
+    this.emit('fallback', { reason: `Your connection (${(bps / 1e6).toFixed(0)} Mbps) is slower than this file needs – switched to adaptive quality.` });
+    this.reload({ forceMode: 'transcode' });
   }
 
   /** Automatic mode, single converted stream: restart one quality step lower. */
@@ -763,7 +831,10 @@ export class Playback extends EventTarget {
       this.stepDown('Playback kept pausing to load');
       return;
     }
-    if (this.mse && (!this._rebuiltAt || Date.now() - this._rebuiltAt > 60000)) {
+    // Starved (nothing buffered when it stopped) means the network can't carry the original:
+    // restarting won't help, go to adaptive quality. Data buffered means a stuck decoder: restart.
+    const starved = (this.stallSnap?.bufferAhead ?? this.bufferedAhead()) < 1;
+    if (this.mse && !starved && (!this._rebuiltAt || Date.now() - this._rebuiltAt > 60000)) {
       // First try a fresh stream at the same spot: it resets the browser's decoder and buffer,
       // which fixes a stuck pipeline without paying for a server-side conversion.
       this._rebuiltAt = Date.now();
@@ -814,7 +885,9 @@ export class Playback extends EventTarget {
       // The server can't encode this rendition in real time and our buffer is draining: step down.
       const t = r.session?.transcode;
       // Single rendition and the encoder runs slower than real time with the buffer draining.
-      if (!this.data.fixedQuality && this.data.renditions.length === 1 && t?.running && !t.throttled && t.speed && t.speed < 0.95 && this.bufferedAhead() < 15) {
+      // Act before the viewer sees a stall: a conversion running under ~1.05× with less than 20 s
+      // buffered will run dry. (The server also remembers the speed and starts lower next time.)
+      if (!this.data.fixedQuality && this.data.renditions.length === 1 && t?.running && !t.throttled && t.age > 10 && t.speed && t.speed < 1.05 && this.bufferedAhead() < 20) {
         this.stepDown('The server can\'t convert this quality in real time');
       }
       if (this.hls && !this.data.fixedQuality && t?.running && t.speed && t.speed < 1.05 && this.bufferedAhead() < 20 && this.hls.currentLevel > 0 && !this.capped) {

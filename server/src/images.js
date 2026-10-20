@@ -98,11 +98,53 @@ function firstEpisodeOf(item) {
   return get(`SELECT id FROM items WHERE ${col} = ? AND type = 'episode' ORDER BY season_number = 0, season_number, episode_number LIMIT 1`, item.id)?.id;
 }
 
+// Sizes the TMDB image CDN serves for any image; we pick the smallest one covering the display size.
+const TMDB_WIDTHS = [92, 154, 185, 300, 342, 500, 780, 1280];
+// Buckets for our own resized copies (local artwork, frames grabbed from video).
+const RESIZE_WIDTHS = [200, 342, 500, 780, 1280];
+const resizeLimit = limiter(2);
+
+function tmdbSized(ref, width) {
+  if (!width) return ref;
+  const target = TMDB_WIDTHS.find((w) => w >= width) || 1280;
+  return ref.replace(/^tmdb:(w\d+|original)\//, `tmdb:w${target}/`);
+}
+
+/** A copy of `file` at most `width` px wide (cached). Avoids sending 1280 px art to 180 px cards. */
+function resized(file, width) {
+  const bucket = RESIZE_WIDTHS.find((w) => w >= width) || 1280;
+  const isPng = /\.png$/i.test(file);
+  return once(`${file}@${bucket}`, async () => {
+    const st = await fsp.stat(file);
+    const key = crypto.createHash('md5').update(`${file}:${st.mtimeMs}:${st.size}`).digest('hex').slice(0, 20);
+    const out = path.join(config.imageCacheDir, 'resized', `${key}_${bucket}.${isPng ? 'png' : 'jpg'}`);
+    if (await exists(out)) return out;
+    await fsp.mkdir(path.dirname(out), { recursive: true });
+    const tmp = `${out}.tmp.${isPng ? 'png' : 'jpg'}`;
+    try {
+      await resizeLimit(() =>
+        exec(config.ffmpeg, ['-hide_banner', '-loglevel', 'error', '-i', file, '-vf', `scale='min(iw,${bucket})':-2:flags=lanczos`, ...(isPng ? [] : ['-q:v', '3']), '-frames:v', '1', '-y', tmp], { timeout: 30000, nice: true })
+      );
+      await fsp.rename(tmp, out);
+      return out;
+    } catch {
+      await fsp.rm(tmp, { force: true });
+      return file; // serve the original rather than nothing
+    }
+  });
+}
+
 /**
- * Resolve the file to serve for an item's image.
+ * Resolve the file to serve for an item's image, optionally sized for display.
  * kind: poster | backdrop | thumb | logo
  */
-export async function resolveImage(itemId, kind) {
+export async function resolveImage(itemId, kind, width = 0) {
+  const file = await resolveImageFile(itemId, kind, width);
+  if (!file || !width || kind === 'logo' || file.startsWith(path.join(config.imageCacheDir, 'tmdb'))) return file;
+  return resized(file, width);
+}
+
+async function resolveImageFile(itemId, kind, width) {
   const item = get('SELECT id, type, poster, backdrop, thumb, logo, parent_id, show_id FROM items WHERE id = ?', itemId);
   if (!item) return null;
   let ref = item[kind];
@@ -122,7 +164,7 @@ export async function resolveImage(itemId, kind) {
     }
     return null;
   }
-  if (ref.startsWith('tmdb:')) return tmdbImage(ref);
+  if (ref.startsWith('tmdb:')) return tmdbImage(kind === 'logo' ? ref : tmdbSized(ref, width));
   if (ref.startsWith('file:')) {
     const p = ref.slice(5);
     return (await exists(p)) ? p : null;

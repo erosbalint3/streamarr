@@ -1,7 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useParams, useSearchParams } from 'react-router-dom';
 import { api } from '../api.js';
+import { useScrollRestore } from '../hooks.js';
 import { PosterCard, LandscapeCard } from '../components/Cards.jsx';
+
+// Pages already loaded per library view, so Back restores the grid (and its scroll) instantly.
+const memo = new Map();
 
 const SORTS = [
   ['title', 'A–Z'],
@@ -17,7 +21,17 @@ export default function Library() {
   const sort = params.get('sort') || 'title';
   const genre = params.get('genre') || '';
   const filter = params.get('filter') || '';
-  const [state, setState] = useState({ items: [], total: 0, genres: [], library: null, loading: true });
+  const key = `${id}|${sort}|${genre}|${filter}`;
+  const [state, setStateRaw] = useState(() => memo.get(key) || { items: [], total: 0, genres: [], library: null, loading: true });
+  const setState = useCallback(
+    (fn) =>
+      setStateRaw((prev) => {
+        const next = typeof fn === 'function' ? fn(prev) : fn;
+        memo.set(key, next);
+        return next;
+      }),
+    [key]
+  );
   const sentinel = useRef(null);
   const loadingMore = useRef(false);
 
@@ -27,16 +41,18 @@ export default function Library() {
       if (genre) q.set('genre', genre);
       if (filter) q.set('filter', filter);
       const r = await api.get(`/api/libraries/${id}/items?${q}`);
-      setState((p) => ({ ...r, items: offset ? [...p.items, ...r.items] : r.items, loading: false }));
+      setState((p) => ({ ...r, items: offset ? [...p.items, ...r.items] : r.items.length >= p.items.length || !p.items.length ? r.items : [...r.items, ...p.items.slice(r.items.length)], loading: false }));
     },
-    [id, sort, genre, filter]
+    [id, sort, genre, filter, setState]
   );
 
   useEffect(() => {
-    setState((p) => ({ ...p, loading: true }));
-    load(0);
-    window.scrollTo(0, 0);
-  }, [load]);
+    const cached = memo.get(key);
+    setStateRaw(cached || { items: [], total: 0, genres: [], library: null, loading: true });
+    // Refresh the first page in the background (not for Shuffle: coming back must not reorder it).
+    if (!cached || sort !== 'random') load(0);
+  }, [load, key, sort]);
+  useScrollRestore(state.items.length > 0 || !state.loading);
 
   useEffect(() => {
     const el = sentinel.current;

@@ -1,3 +1,6 @@
+import { expectedSpeed } from './encoderStats.js';
+import { levelsFor } from './encoder.js';
+
 // Decides HOW a file is delivered to a specific client. Order of preference:
 //   1. direct    – the original file over HTTP range requests (zero server CPU, perfect quality)
 //   2. remux     – video copied bit-for-bit, audio converted if needed, streamed as fragmented MP4
@@ -137,9 +140,19 @@ export function decide(media, opts) {
   const lock = mode === 'transcode' ? fixedRung || (opts.quality === 'original' ? fullLadder[0] : null) : null;
   if (lock) ladder = [lock];
   else if (mode === 'transcode') {
-    // Only the renditions this connection can actually carry.
+    // Only the renditions this connection can actually carry…
     const fit = fullLadder.filter((r) => r.bitrate * 1.3 <= budget);
-    const usable = fit.length ? fit : [fullLadder[fullLadder.length - 1]];
+    // …and that this server has been able to convert comfortably faster than real time.
+    const enc = `${settings.hwaccel}/${levelsFor(settings.hwaccel)[0]}`;
+    const fast = fit.filter((r) => {
+      const sp = expectedSpeed(media, r.height, enc);
+      return sp == null || sp >= 1.3;
+    });
+    if (fit.length && fast.length < fit.length) {
+      const slow = fit.find((r) => !fast.includes(r));
+      reasons.push(`this server converts ${slow.id} at only ${expectedSpeed(media, slow.height, enc).toFixed(1)}× real time`);
+    }
+    const usable = fast.length ? fast : fit.length ? [fit[fit.length - 1]] : [fullLadder[fullLadder.length - 1]];
     // Lots of headroom (home network): a single rendition. Adaptive switching only helps on
     // constrained links; with an on-the-fly encoder every switch costs a fresh encoder start.
     ladder = usable[0].bitrate * 2.5 <= budget ? [usable[0]] : usable;

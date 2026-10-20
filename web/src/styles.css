@@ -1673,6 +1673,20 @@ code.path {
   object-fit: contain;
   background: #000;
 }
+.player-poster {
+  position: absolute;
+  inset: 0;
+  background: #000 center / cover no-repeat;
+  opacity: 0.35;
+  filter: blur(2px) saturate(0.9);
+  pointer-events: none;
+  animation: poster-in 0.4s ease both;
+}
+@keyframes poster-in {
+  from {
+    opacity: 0;
+  }
+}
 .player-top,
 .player-bottom {
   position: absolute;

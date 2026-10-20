@@ -6,8 +6,8 @@ import { requireUser } from '../auth.js';
 import { getItem, card } from '../serialize.js';
 import { mediaForItem, audioLabel, subtitleLabel } from '../streaming/media.js';
 import { decide, pickDefaultTracks } from '../streaming/decision.js';
-import { keyframeBefore, inspectAround } from '../util/ffprobe.js';
-import { createSession, getSession, stopSession, masterPlaylist, mediaPlaylist, getSegment, startRemux, sessionSummary, segmentSeconds } from '../streaming/sessions.js';
+import { keyframeBefore, keyframeAfter, inspectAround } from '../util/ffprobe.js';
+import { createSession, getSession, stopSession, masterPlaylist, mediaPlaylist, getSegment, prestartRemux, takeRemux, sessionSummary, segmentSeconds } from '../streaming/sessions.js';
 import { adjacentEpisode } from './library.js';
 
 // Incompressible bytes for the bandwidth probe.
@@ -61,7 +61,7 @@ export default async function playbackRoutes(app) {
     }
   });
 
-  app.get('/api/speedtest', { preHandler: requireUser }, async (req, reply) => {
+  app.get('/api/speedtest', { preHandler: requireUser, compress: false }, async (req, reply) => {
     const bytes = Math.min(Math.max(Number(req.query.bytes) || 2 * 1024 * 1024, 64 * 1024), SPEEDTEST.length);
     return reply.header('Content-Type', 'application/octet-stream').header('Cache-Control', 'no-store, no-transform').header('Content-Length', bytes).send(SPEEDTEST.subarray(0, bytes));
   });
@@ -108,6 +108,7 @@ export default async function playbackRoutes(app) {
     else if (decision.mode === 'remux') {
       offset = await keyframeBefore(media.path, startPosition, media.video.startTime || 0);
       url = `/api/stream/${session.id}/remux?offset=${offset.toFixed(3)}`;
+      prestartRemux(session, Number(offset.toFixed(3)));
     } else url = `/api/stream/${session.id}/master.m3u8`;
 
     let next = null;
@@ -156,7 +157,11 @@ export default async function playbackRoutes(app) {
     const s = getSession(req.params.sid);
     if (!s) return reply.code(404).send({ error: 'Playback session expired.' });
     const t = Math.max(0, Math.min(Number(req.body?.position) || 0, s.media.duration - 1));
-    const offset = await keyframeBefore(s.media.path, t, s.media.video.startTime || 0);
+    // after: start at the next keyframe instead (skipping a section the browser can't decode).
+    const offset = req.body?.after
+      ? Math.min(await keyframeAfter(s.media.path, t, s.media.video.startTime || 0), s.media.duration - 1)
+      : await keyframeBefore(s.media.path, t, s.media.video.startTime || 0);
+    prestartRemux(s, Number(offset.toFixed(3)));
     return { url: `/api/stream/${s.id}/remux?offset=${offset.toFixed(3)}`, offset };
   });
 
@@ -242,17 +247,17 @@ export default async function playbackRoutes(app) {
   });
 
   // ---------------- stream delivery (the session id is the capability token)
-  app.get('/api/stream/:sid/direct', async (req, reply) => {
+  app.get('/api/stream/:sid/direct', { compress: false }, async (req, reply) => {
     const s = getSession(req.params.sid);
     if (!s || s.mode !== 'direct') return reply.code(404).send();
     return serveFileRange(req, reply, s.media.path, s.media.size, MIME[s.media.container] || 'video/mp4');
   });
 
-  app.get('/api/stream/:sid/remux', async (req, reply) => {
+  app.get('/api/stream/:sid/remux', { compress: false }, async (req, reply) => {
     const s = getSession(req.params.sid);
     if (!s) return reply.code(404).send();
     const offset = Math.max(0, Number(req.query.offset) || 0);
-    const proc = startRemux(s, offset);
+    const proc = takeRemux(s, offset);
     reply.hijack();
     reply.raw.writeHead(200, {
       'Content-Type': 'video/mp4',
@@ -281,7 +286,7 @@ export default async function playbackRoutes(app) {
     return reply.header('Content-Type', 'application/vnd.apple.mpegurl').header('Cache-Control', 'no-store').send(mediaPlaylist(s));
   });
 
-  app.get('/api/stream/:sid/:rid/:seg', async (req, reply) => {
+  app.get('/api/stream/:sid/:rid/:seg', { compress: false }, async (req, reply) => {
     const s = getSession(req.params.sid);
     const m = /^seg_(\d+)\.ts$/.exec(req.params.seg);
     if (!s || !m) return reply.code(404).send();

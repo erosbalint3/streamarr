@@ -49,9 +49,17 @@ export function detectCaps() {
 
 // ------------------------------------------------------------ bandwidth probe
 
-async function probe(bytes, timeoutMs) {
+// Background measurements share one controller so playback can cancel them instantly.
+let backgroundCtrl = null;
+export function cancelBackgroundProbe() {
+  backgroundCtrl?.abort();
+  backgroundCtrl = null;
+}
+
+async function probe(bytes, timeoutMs, outer = null) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  outer?.addEventListener('abort', () => ctrl.abort(), { once: true });
   const t0 = performance.now();
   try {
     const res = await fetch(`/api/speedtest?bytes=${bytes}&r=${Math.random()}`, { cache: 'no-store', signal: ctrl.signal, credentials: 'same-origin' });
@@ -74,26 +82,83 @@ async function probe(bytes, timeoutMs) {
   }
 }
 
-/** Estimate download bandwidth in bits/s. Adapts the probe size so slow links aren't punished. */
-export async function measureBandwidth({ force = false } = {}) {
+const BW_KEY = 'sa_bw2';
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function loadEstimate() {
   try {
-    const cached = JSON.parse(sessionStorage.getItem('sa_bw') || 'null');
-    if (!force && cached && Date.now() - cached.at < 10 * 60 * 1000) return cached.bps;
+    return JSON.parse(localStorage.getItem(BW_KEY) || 'null');
   } catch {
-    /* ignore */
+    return null;
   }
-  await probe(64 * 1024, 3000); // warm the connection
-  let r = await probe(512 * 1024, 4000);
+}
+
+/** Remember a throughput measurement (from a probe or from a real stream). */
+export function saveBandwidth(bps, source = 'probe') {
+  if (!(bps > 0)) return;
+  try {
+    localStorage.setItem(BW_KEY, JSON.stringify({ bps: Math.round(bps), at: Date.now(), source }));
+  } catch {
+    /* private mode */
+  }
+}
+
+/** Thorough measurement (up to ~20 MB). For the settings page and idle-time refreshes – never on the play path. */
+export async function measureBandwidth({ force = false, signal = null } = {}) {
+  const cached = loadEstimate();
+  if (!force && cached && Date.now() - cached.at < 10 * 60 * 1000) return cached.bps;
+  await probe(64 * 1024, 3000, signal); // warm the connection
+  let r = await probe(512 * 1024, 4000, signal);
   if (!r.aborted && r.total < 700) {
-    r = await probe(4 * 1024 * 1024, 5000);
-    if (!r.aborted && r.total < 500) r = await probe(16 * 1024 * 1024, 5000);
+    r = await probe(4 * 1024 * 1024, 5000, signal);
+    if (!r.aborted && r.total < 500) r = await probe(16 * 1024 * 1024, 5000, signal);
   }
+  if (signal?.aborted) return cached?.bps || 0;
   const bps = r.bytes ? Math.round((r.bytes * 8) / (r.ms / 1000)) : 0;
-  try {
-    sessionStorage.setItem('sa_bw', JSON.stringify({ bps, at: Date.now() }));
-  } catch {
-    /* ignore */
-  }
+  saveBandwidth(bps, 'probe');
   return bps;
 }
 
+/**
+ * Bandwidth for starting playback, without making the viewer wait (like Netflix: start now,
+ * learn from the stream). Uses the remembered estimate; on a first visit a small probe capped at
+ * ~1 s. Returns 0 when unknown – the server then assumes the original fits and the stall
+ * watchdog corrects it if not.
+ */
+export async function quickBandwidth() {
+  const c = loadEstimate();
+  if (c && Date.now() - c.at < 6 * 3600 * 1000) return c.bps;
+  // Small first, bigger only if the link is fast (a short sample underestimates fast links while
+  // TCP is still ramping up). Never more than ~1.2 s in total.
+  let best = null;
+  const take = (r) => {
+    if (r && r.bytes && !r.aborted && (!best || r.bytes * 8 / r.ms > best.bytes * 8 / best.ms)) best = r;
+    return r;
+  };
+  await Promise.race([
+    (async () => {
+      await probe(32 * 1024, 800);
+      const first = take(await probe(384 * 1024, 900));
+      if (first && !first.aborted && first.total < 300) take(await probe(2 * 1024 * 1024, 900));
+    })(),
+    sleepMs(1200),
+  ]);
+  const r = best;
+  const bps = r && r.bytes && !r.aborted ? Math.round((r.bytes * 8) / (r.ms / 1000)) : 0;
+  if (bps) saveBandwidth(bps, 'quick');
+  return bps;
+}
+
+/** Called while the app is idle (not playing): keep the estimate fresh for the next play. */
+export function refreshBandwidthWhenIdle() {
+  const c = loadEstimate();
+  if (c && Date.now() - c.at < 60 * 60 * 1000) return;
+  const run = () => {
+    if (location.pathname.startsWith('/play/')) return;
+    cancelBackgroundProbe();
+    backgroundCtrl = new AbortController();
+    measureBandwidth({ force: true, signal: backgroundCtrl.signal }).catch(() => {});
+  };
+  if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 10000 });
+  else setTimeout(run, 3000);
+}

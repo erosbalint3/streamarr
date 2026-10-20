@@ -31,12 +31,72 @@ function safeJson(t) {
   }
 }
 
+// ---------------------------------------------------------------- stale-while-revalidate cache
+// Pages render from memory instantly (Back, revisits, hovered cards) and refresh in the background.
+const cache = new Map(); // url -> { data, at, promise }
+const listeners = new Map(); // url -> Set<fn>
+
+function fetchInto(url) {
+  const entry = cache.get(url) || {};
+  if (entry.promise) return entry.promise;
+  const promise = request('GET', url)
+    .then((data) => {
+      cache.set(url, { data, at: Date.now() });
+      listeners.get(url)?.forEach((fn) => fn(data));
+      return data;
+    })
+    .catch((e) => {
+      const cur = cache.get(url);
+      if (cur) delete cur.promise;
+      throw e;
+    });
+  cache.set(url, { ...entry, promise });
+  return promise;
+}
+
+/** Cached data for a URL (or undefined) – synchronous, for the first render. */
+export function peek(url) {
+  return cache.get(url)?.data;
+}
+
+/** Warm the cache (e.g. on hover); does nothing if the data is fresh. */
+export function prefetch(url, maxAge = 30000) {
+  const e = cache.get(url);
+  if (e?.promise || (e?.data !== undefined && Date.now() - e.at < maxAge)) return;
+  fetchInto(url).catch(() => {});
+}
+
+export function subscribe(url, fn) {
+  if (!listeners.has(url)) listeners.set(url, new Set());
+  listeners.get(url).add(fn);
+  return () => listeners.get(url)?.delete(fn);
+}
+
+/** Drop cached responses whose URL starts with a prefix (after a change on the server). */
+export function invalidate(prefix = '/api/') {
+  for (const k of cache.keys()) if (k.startsWith(prefix)) cache.delete(k);
+}
+
 export const api = {
   get: (url) => request('GET', url),
-  post: (url, body = {}) => request('POST', url, body),
+  /** Cached GET: resolves from memory when fresh, refetches otherwise. */
+  cached: (url, maxAge = 15000) => {
+    const e = cache.get(url);
+    if (e?.data !== undefined && Date.now() - e.at < maxAge) return Promise.resolve(e.data);
+    return fetchInto(url);
+  },
+  revalidate: (url) => fetchInto(url),
+  post: (url, body = {}) => request('POST', url, body).finally(() => invalidate('/api/home')),
   put: (url, body = {}) => request('PUT', url, body),
   del: (url) => request('DELETE', url),
 };
+
+/** Size an artwork URL for how large it is shown (the server picks or makes that size). */
+export function sized(url, cssWidth) {
+  if (!url) return url;
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  return `${url}${url.includes('?') ? '&' : '?'}w=${Math.round(cssWidth * dpr)}`;
+}
 
 export function formatDuration(seconds, { long = false } = {}) {
   if (!Number.isFinite(seconds) || seconds < 0) seconds = 0;

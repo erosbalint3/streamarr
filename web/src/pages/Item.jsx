@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
-import { api, episodeCode, formatBitrate, formatBytes, formatDuration, resolutionLabel } from '../api.js';
+import { api, peek, sized, episodeCode, formatBitrate, formatBytes, formatDuration, resolutionLabel } from '../api.js';
 import { useAuth } from '../auth.jsx';
+import { useApi, useScrollRestore } from '../hooks.js';
 import { EpisodeRow, Img, PosterCard, TypePoster } from '../components/Cards.jsx';
 import { IconPlay, IconCheck, IconBookmark, IconBookmarkFilled, IconRefresh, IconArrowLeft } from '../components/Icons.jsx';
 import { toast } from '../components/Toast.jsx';
@@ -62,7 +63,10 @@ function Seasons({ show, onChanged }) {
 
   const load = useCallback(() => {
     if (!active) return;
-    api.get(`/api/items/${active}/children`).then(setEpisodes);
+    const url = `/api/items/${active}/children`;
+    const cached = peek(url);
+    setEpisodes(cached || null);
+    api.revalidate(url).then(setEpisodes).catch(() => {});
   }, [active]);
   useEffect(load, [load]);
 
@@ -93,21 +97,21 @@ export default function Item() {
   const { id } = useParams();
   const { user } = useAuth();
   const navigate = useNavigate();
-  const [item, setItem] = useState(null);
-  const [error, setError] = useState('');
+  // Instant from cache (prefetched when the card was hovered), refreshed in the background.
+  const { data, error: loadError, reload } = useApi(`/api/items/${id}`);
+  const [override, setOverride] = useState({});
+  const item = data ? { ...data, ...override } : null;
+  const setItem = (fn) => setOverride((o) => ({ ...o, ...fn(item) }));
+  const error = loadError?.message || '';
+  const load = reload;
   const [audio, setAudio] = useState();
   const [sub, setSub] = useState();
-
-  const load = useCallback(() => {
-    api.get(`/api/items/${id}`).then(setItem).catch((e) => setError(e.message));
-  }, [id]);
   useEffect(() => {
-    setItem(null);
+    setOverride({});
     setAudio(undefined);
     setSub(undefined);
-    load();
-    window.scrollTo(0, 0);
-  }, [load]);
+  }, [id]);
+  useScrollRestore(!!data);
 
   if (error) return <div className="empty"><p>{error}</p></div>;
   if (!item) return <div className="item-skeleton" aria-busy="true" />;
@@ -131,7 +135,7 @@ export default function Item() {
   };
   const toggleFav = async () => {
     const r = await api.post(`/api/items/${item.id}/favorite`, { favorite: !item.favorite });
-    setItem((p) => ({ ...p, favorite: r.favorite }));
+    setItem(() => ({ favorite: r.favorite }));
     toast(r.favorite ? 'Added to My list' : 'Removed from My list');
   };
   const refresh = async () => {
@@ -182,9 +186,9 @@ export default function Item() {
         <div className="item-main">
           <div className={`item-poster ${isEpisode || item.type === 'video' ? 'item-poster-wide' : ''}`}>
             {isEpisode || item.type === 'video' ? (
-              <Img src={item.thumb} alt="" eager fallback={<TypePoster title={item.title} small />} />
+              <Img src={sized(item.thumb, 440)} alt="" eager fallback={<TypePoster title={item.title} small />} />
             ) : (
-              <Img src={item.poster} alt="" eager fallback={<TypePoster title={heading} year={item.year} />} />
+              <Img src={sized(item.poster, 280)} alt="" eager fallback={<TypePoster title={heading} year={item.year} />} />
             )}
           </div>
           <div className="item-info">

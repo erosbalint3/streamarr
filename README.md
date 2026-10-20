@@ -16,12 +16,12 @@ Most "buffering…" on a good connection isn't the network — it's the server's
 | Shallow buffers | Direct stream is fed through Media Source Extensions by the player, which keeps **~150 s buffered ahead** (a plain `<video>` on a progressive stream only buffers 2–3 s in Chrome). HLS playback keeps 90 s (up to 10 min) ahead. |
 | Transcoder throttled too early | The encoder runs **4 minutes ahead** of the furthest segment requested before it's paused (`SIGSTOP`, instant resume). Plex keeps roughly a minute. Configurable. |
 | One fixed transcode quality | Transcodes are a real **adaptive-bitrate ladder** (2160p → 360p). The player steps down instead of stalling. Only the rendition actually being watched is encoded. |
-| Slow seeking | Keyframes are forced on a fixed 4-second grid, so a seek **restarts the encoder exactly at the target segment** (~2 s on a modest CPU) and segments from different renditions/encoder runs line up perfectly. |
-| Original file too heavy for the link | A **bandwidth probe** runs before playback; files whose bitrate (plus headroom for peaks) exceeds ~85% of the measured throughput start in adaptive mode. |
-| Buffering anyway | A **stall watchdog**: one long stall (>7 s) or 3 stalls in 90 s while playing the original switches to adaptive streaming at the same position; in adaptive mode it caps the ladder one rung lower for two minutes. |
-| Server can't keep up | The server reports transcode speed; if it drops below real time while the client buffer drains, the player lowers quality preemptively. CPU-only servers are never offered renditions above `MAX_SOFTWARE_HEIGHT` (default 1080p). |
+| Slow seeking | Converted streams use a fixed 2-second keyframe grid, so a seek **restarts the encoder exactly at the target segment** (~1.2 s for 1080p H.264 on a modest CPU). Direct stream seeks cancel the obsolete download instantly and restart at the nearest keyframe (0.2–1 s). |
+| Original file too heavy for the link | Playback **starts immediately** with the remembered connection speed (first visit: a ≤1.2 s check); the full speed test only runs while you browse. The player then measures the real stream in its first ~1.5 s and switches to adaptive quality *before* the buffer runs dry if the connection can't carry the original. |
+| Buffering anyway | A **stall watchdog** that tells causes apart: a stall with an empty buffer (network) switches to adaptive streaming; a stall with data buffered (stuck decoder) gets a fresh restart at the same spot first. Decoder errors on a damaged section: restart → skip to the next keyframe → convert just that part and return to the original. |
+| Server can't keep up | The server **learns how fast it converts** each kind of source to each quality and only offers qualities it sustains at ≥1.3× real time. While playing, a conversion running under ~1.05× with < 20 s buffered steps down before the viewer sees a stall. CPU-only servers are never offered renditions above `MAX_SOFTWARE_HEIGHT` (default 1080p). |
 | GPU path breaks | VAAPI/NVENC jobs that fail fall back to hybrid (CPU decode/filters + GPU encode) and then pure CPU, automatically and invisibly. |
-| Background jobs fighting the stream | Thumbnail and subtitle extraction pause whenever anyone is transcoding. |
+| Background jobs fighting the stream | Thumbnail and subtitle extraction freeze whenever a player is open (any mode) and run in the idle disk-priority class. |
 
 ```mermaid
 flowchart LR
@@ -35,6 +35,8 @@ flowchart LR
   P -. stalls .-> T
   R -. stalls .-> T
 ```
+
+**Snappy like a streaming service:** the player code loads while you browse (hls.js only when a stream is converted), the stream request starts in parallel with the player's media buffer, pages render instantly from cache on Back and on cards you hovered, artwork is served at the size it is displayed, and app code and API responses are compressed (Brotli).
 
 The **Playback info** panel in the player (press `i`) shows the mode, why it was chosen, buffer depth, connection estimate, dropped frames and live encoder speed.
 
